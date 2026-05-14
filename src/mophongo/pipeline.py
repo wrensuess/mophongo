@@ -15,12 +15,13 @@ from copy import deepcopy
 import logging
 import numpy as np
 from collections import defaultdict
+from scipy.signal import fftconvolve
 
 from astropy.table import Table
 from astropy.wcs import WCS
 from astropy.nddata import Cutout2D, block_replicate, block_reduce
 from photutils.aperture import CircularAperture, aperture_photometry
-from astropy.wcs.utils import proj_plane_pixel_scales
+from photutils.segmentation import SegmentationImage
 from astropy.wcs.utils import proj_plane_pixel_scales
 
 from .psf_map import PSFRegionMap
@@ -425,90 +426,245 @@ class Pipeline:
 
         return out
 
+    @staticmethod
+    def _get_representative_kernel(kernel) -> np.ndarray | None:
+        """Return a normalized representative kernel from a PSFRegionMap or ndarray, or None."""
+        if isinstance(kernel, np.ndarray) and kernel.ndim == 2:
+            arr = kernel
+        elif hasattr(kernel, "psfs") and len(kernel.psfs) > 0:
+            arr = kernel.psfs[len(kernel.psfs) // 2]
+        else:
+            return None
+        total = float(arr.sum())
+        return (arr / total) if total > 0 else None
+
     def _aperture_sum_on_template(self, tmpl: Template, radius_pix: float) -> float:
-        """Exact aperture sum on a template image centered on its own center."""
-        x0 = tmpl.input_position_cutout[0]  # - tmpl.slices_cutout[1].start
-        y0 = tmpl.input_position_cutout[1]  # - tmpl.slices_cutout[0].start
+        """Exact circular aperture sum on a template, centred on the source."""
+        x0 = tmpl.input_position_cutout[0]
+        y0 = tmpl.input_position_cutout[1]
         aper = CircularAperture((float(x0), float(y0)), r=float(radius_pix))
         phot = aperture_photometry(tmpl.data, aper, method="exact")
         return float(phot["aperture_sum"][0])
 
+    @staticmethod
+    def _intersect_slices(tmpl: Template, y0: int, y1: int, x0: int, x1: int):
+        """Compute the intersection of a template's valid region with a bounding box.
+
+        Returns (patch_ys, patch_xs, data_ys, data_xs) in patch-local and
+        template-data coordinates, or None if there is no overlap.
+        """
+        iy0 = tmpl.slices_original[0].start
+        iy1 = tmpl.slices_original[0].stop
+        ix0 = tmpl.slices_original[1].start
+        ix1 = tmpl.slices_original[1].stop
+
+        cy0 = max(iy0, y0)
+        cy1 = min(iy1, y1)
+        cx0 = max(ix0, x0)
+        cx1 = min(ix1, x1)
+
+        if cy1 <= cy0 or cx1 <= cx0:
+            return None
+
+        patch_ys = slice(cy0 - y0, cy1 - y0)
+        patch_xs = slice(cx0 - x0, cx1 - x0)
+
+        dc_y0 = tmpl.slices_cutout[0].start
+        dc_x0 = tmpl.slices_cutout[1].start
+        data_ys = slice(dc_y0 + (cy0 - iy0), dc_y0 + (cy1 - iy0))
+        data_xs = slice(dc_x0 + (cx0 - ix0), dc_x0 + (cx1 - ix0))
+
+        return patch_ys, patch_xs, data_ys, data_xs
+
     def _add_aperture_photometry(
         self,
         cat: Table,
-        templates: list[Template],  # post-conv templates (current band)
-        fluxes: np.ndarray,  # best-fit per-template fluxes
-        residual: np.ndarray,  # residual image (same grid as ref if you upsampled)
-        psf: np.ndarray | PSFRegionMap | None,
-        idx: int,  # current image index (>=1)
+        templates: list[Template],
+        fluxes: np.ndarray,
+        residual: np.ndarray,
+        idx: int,
+        orig_templates: list[Template] | None = None,
+        f444w_totals: dict[int, float] | None = None,
+        det_image: np.ndarray | None = None,
+        kernel_rep: np.ndarray | None = None,
+        scenes: list | None = None,
     ) -> None:
+        """Measure aperture flux on (model+residual) and compute the aperture correction.
+
+        Two modes:
+
+        Mode A (default, f444w_totals=None):
+            corr = sum(T_conv) / aperture_sum(T_conv, r)
+            Assumes F444W total flux = 1 (template normalised to infinity).  The
+            sum(T_conv) in the numerator cancels any kernel-flux loss so the ratio
+            is a true EE fraction.
+
+        Mode B (f444w_totals provided with det_image, kernel_rep, scenes):
+            corr = f444w_total_i / aperture(F444W_psf_matched, x_i, r)
+            where F444W_psf_matched = scene model (conv templates × catalog fluxes)
+                                    + convolved F444W residual.
+            Implements Yoshi's formula directly, handling crowding and extended
+            sources.  Falls back to Mode A for any source missing f444w_totals.
+
+        Writes ap_model_{idx}, ap_flux_{idx}, ap_corr_{idx}, ap_flux_corr_{idx}.
         """
-        Measure aperture flux on (model+residual) and PSF-correct it using
-        the ratio of pre/post-convolution *template* aperture integrals:
-
-            corr = F_cat(tmpl_ref_preconv) / F_img(tmpl_ref_postconv)
-
-        Writes:
-        ap_flux_raw_{idx}  – raw aperture sum on model+residual
-        ap_corr_{idx}      – correction factor
-        ap_flux_{idx}      – corrected flux
-        """
-        from photutils.aperture import CircularAperture, aperture_photometry
-
         cfg = self.config
         id_to_row = {int(i): k for k, i in enumerate(cat["id"])}
 
-        # ensure columns exist
         for name in (f"ap_model_{idx}", f"ap_flux_{idx}", f"ap_corr_{idx}", f"ap_flux_corr_{idx}"):
             if name not in cat.colnames:
                 cat[name] = cfg.bad_value
 
-        # radii
-        r_img_pix = self._resolve_image_ap_radius_pix(
-            idx, cfg
-        )  # same for all in this band (by design)
-        # residual+model patch measurement (raw)
-        for tmpl, fl in zip(templates, fluxes):
-            pid = tmpl.id_parent if getattr(tmpl, "parent_id", None) is not None else tmpl.id
-            row = id_to_row.get(int(pid))
-            if row is None:
-                continue
+        r_img_pix = self._resolve_image_ap_radius_pix(idx, cfg)
 
-            # --- raw aperture flux on (model + residual) in the *current image* ---
-            res_patch = residual[tmpl.slices_original]
-            model_patch = fl * tmpl.data[tmpl.slices_cutout]
-            patch = res_patch + model_patch
+        use_mode_b = (
+            f444w_totals is not None
+            and det_image is not None
+            and kernel_rep is not None
+            and scenes is not None
+            and orig_templates is not None
+        )
+        print(
+            f"  Computing aperture corrections (image {idx}, {len(templates)} sources, "
+            f"mode={'B (scale to total catalog flux)' if use_mode_b else 'A (scale to total template flux)'})"
+        )
 
-            x0 = tmpl.input_position_cutout[0] - tmpl.slices_cutout[1].start
-            y0 = tmpl.input_position_cutout[1] - tmpl.slices_cutout[0].start
-            aper_img = CircularAperture((float(x0), float(y0)), r=float(r_img_pix))
-            phot = aperture_photometry(patch, aper_img, method="exact")
-            ap_raw = float(phot["aperture_sum"][0])
+        orig_by_id = {t.id: t for t in orig_templates} if orig_templates else {}
+        img_h, img_w = det_image.shape if det_image is not None else (0, 0)
 
-            # --- correction from aperture flux to total flux via template EE -----------
-            # numerator: total flux of the convolved template (= post-conv sum).
-            # Using the post-conv total (rather than 1.0) accounts for any flux lost
-            # at the template boundary during convolution.
-            # denominator: flux of the convolved template within the photometric aperture.
-            # corr = num/den = post_conv_total / post_conv_aperture = 1/EE_source_MIRI(r),
-            # which converts ap_raw (partial aperture flux) to total flux.
-            # Previously num used aperture_sum(pre_conv_template, r), which gave
-            # EE_source_F444W(r) ~ 0.3 in the numerator and caused a ~1.2 mag offset.
-            num = float(tmpl.data.sum())
+        def _ap_raw(tmpl, fl):
+            """Raw aperture flux on MIRI (model + residual patch)."""
+            patch = residual[tmpl.slices_original] + fl * tmpl.data[tmpl.slices_cutout]
+            xc = tmpl.input_position_cutout[0] - tmpl.slices_cutout[1].start
+            yc = tmpl.input_position_cutout[1] - tmpl.slices_cutout[0].start
+            return float(
+                aperture_photometry(patch, CircularAperture((xc, yc), r=r_img_pix), method="exact")[
+                    "aperture_sum"
+                ][0]
+            )
 
-            # denominator: current *convolved* template with *image* aperture
-            den = self._aperture_sum_on_template(tmpl, r_img_pix)
-
-            ap_model = fl * den  # aperture flux on model only (for info)
-
-            # safe correction
-            corr = num / den if (np.isfinite(num) and np.isfinite(den) and den > 0) else 1.0
-            ap_corr = ap_raw * corr
-
-            cat[f"ap_model_{idx}"][row] = ap_model
+        def _write(row, tmpl, fl, corr):
+            if not (np.isfinite(corr) and corr > 0):
+                corr = cfg.bad_value
+            ap_raw = _ap_raw(tmpl, fl)
+            cat[f"ap_model_{idx}"][row] = fl * self._aperture_sum_on_template(tmpl, r_img_pix)
             cat[f"ap_flux_{idx}"][row] = ap_raw
             cat[f"ap_corr_{idx}"][row] = corr
-            cat[f"ap_flux_corr_{idx}"][row] = ap_corr
+            cat[f"ap_flux_corr_{idx}"][row] = ap_raw * corr if np.isfinite(corr) and corr > 0 else cfg.bad_value
+
+        # ------------------------------------------------------------------ #
+        # Mode B: Yoshi's formula with PSF-matched F444W scene               #
+        # ------------------------------------------------------------------ #
+        if use_mode_b:
+            kh, kw = kernel_rep.shape
+            kpad_y = kh // 2 + 1
+            kpad_x = kw // 2 + 1
+
+            # Build a template-id → (conv_tmpl, miri_flux) lookup for fast access
+            conv_by_id: dict[int, tuple[Template, float]] = {
+                t.id: (t, fl) for t, fl in zip(templates, fluxes)
+            }
+
+            for scene in scenes:
+                scene_tmpls = scene.templates
+
+                # Bounding box of the scene from convolved template footprints
+                y0_sc = min(t.bbox[0] for t in scene_tmpls)
+                y1_sc = max(t.bbox[1] for t in scene_tmpls)
+                x0_sc = min(t.bbox[2] for t in scene_tmpls)
+                x1_sc = max(t.bbox[3] for t in scene_tmpls)
+
+                # Padded region for residual convolution (clamped to image)
+                py0 = max(0, y0_sc - kpad_y)
+                py1 = min(img_h, y1_sc + kpad_y)
+                px0 = max(0, x0_sc - kpad_x)
+                px1 = min(img_w, x1_sc + kpad_x)
+                ph = py1 - py0
+                pw = px1 - px0
+                sh = y1_sc - y0_sc
+                sw = x1_sc - x0_sc
+
+                # --- F444W original-resolution scene model (in padded region) ---
+                f444w_orig_model = np.zeros((ph, pw), dtype=np.float64)
+                for tmpl in scene_tmpls:
+                    f444w_j = f444w_totals.get(int(tmpl.id))
+                    orig_t = orig_by_id.get(tmpl.id)
+                    if f444w_j is None or orig_t is None:
+                        continue
+                    isect = self._intersect_slices(orig_t, py0, py1, px0, px1)
+                    if isect is None:
+                        continue
+                    pys, pxs, dys, dxs = isect
+                    f444w_orig_model[pys, pxs] += f444w_j * orig_t.data[dys, dxs]
+
+                # --- F444W residual: det_image minus model, then convolve ---
+                f444w_residual = det_image[py0:py1, px0:px1].astype(np.float64) - f444w_orig_model
+                f444w_res_conv = fftconvolve(f444w_residual, kernel_rep, mode="same")
+
+                # --- F444W convolved scene model (unpadded scene region) ---
+                f444w_conv_model = np.zeros((sh, sw), dtype=np.float64)
+                for tmpl in scene_tmpls:
+                    f444w_j = f444w_totals.get(int(tmpl.id))
+                    if f444w_j is None:
+                        continue
+                    norm = float(tmpl.data.sum())
+                    if norm <= 0:
+                        continue
+                    isect = self._intersect_slices(tmpl, y0_sc, y1_sc, x0_sc, x1_sc)
+                    if isect is None:
+                        continue
+                    pys, pxs, dys, dxs = isect
+                    f444w_conv_model[pys, pxs] += (f444w_j / norm) * tmpl.data[dys, dxs]
+
+                # Extract the unpadded portion of the convolved residual
+                res_conv_scene = f444w_res_conv[y0_sc - py0: y0_sc - py0 + sh,
+                                                x0_sc - px0: x0_sc - px0 + sw]
+
+                f444w_psf_matched = f444w_conv_model + res_conv_scene
+
+                # --- Per-source aperture and correction ---
+                for tmpl in scene_tmpls:
+                    row = id_to_row.get(int(tmpl.id))
+                    if row is None:
+                        continue
+
+                    f444w_j = f444w_totals.get(int(tmpl.id))
+                    fl = tmpl.flux if hasattr(tmpl, "flux") and tmpl.flux is not None else 0.0
+
+                    if f444w_j is None:
+                        # Fall back to Mode A for this source
+                        den = self._aperture_sum_on_template(tmpl, r_img_pix)
+                        tmpl_total = float(tmpl.data.sum())
+                        corr = (tmpl_total / den) if den > 0 else cfg.bad_value
+                        _write(row, tmpl, fl, corr)
+                        continue
+
+                    # Aperture on PSF-matched F444W in scene-local coords
+                    x_sc = tmpl.input_position_original[0] - x0_sc
+                    y_sc = tmpl.input_position_original[1] - y0_sc
+                    ap_denom = float(
+                        aperture_photometry(
+                            f444w_psf_matched,
+                            CircularAperture((x_sc, y_sc), r=r_img_pix),
+                            method="exact",
+                        )["aperture_sum"][0]
+                    )
+
+                    corr = (f444w_j / ap_denom) if ap_denom > 0 else cfg.bad_value
+                    _write(row, tmpl, fl, corr)
+
+        # ------------------------------------------------------------------ #
+        # Mode A: template-normalised correction                              #
+        # ------------------------------------------------------------------ #
+        else:
+            for tmpl, fl in zip(templates, fluxes):
+                row = id_to_row.get(int(tmpl.id))
+                if row is None:
+                    continue
+                den = self._aperture_sum_on_template(tmpl, r_img_pix)
+                tmpl_total = float(tmpl.data.sum())
+                corr = (tmpl_total / den) if den > 0 else cfg.bad_value
+                _write(row, tmpl, fl, corr)
 
     def run(self, config: FitConfig | None = None) -> tuple[Table, list[np.ndarray]]:
         """Run photometry on the configured images.
@@ -561,6 +717,8 @@ class Pipeline:
             cat = cat["id", "x", "y"]  # minimal set required
             if config.aperture_catalog is not None:
                 cat[config.aperture_catalog] = catalog[config.aperture_catalog]
+            if config.f444w_col is not None and config.f444w_col in catalog.colnames:
+                cat[config.f444w_col] = catalog[config.f444w_col]
 
         self.tmpls = Templates()
         self.tmpls.extract_templates(
@@ -589,6 +747,20 @@ class Pipeline:
         residuals: list[np.ndarray] = []
         self.all_templates: list[Template] = []
         self.all_scenes: list[Scene] = []
+
+        # Build F444W total-flux lookup for Mode B aperture correction (Yoshi's formula).
+        f444w_totals: dict[int, float] | None = None
+        if config.f444w_col is not None:
+            if config.f444w_col in cat.colnames:
+                f444w_totals = {
+                    int(cat["id"][k]): float(cat[config.f444w_col][k])
+                    for k in range(len(cat))
+                    if np.isfinite(float(cat[config.f444w_col][k]))
+                }
+                print(f"Mode B aperture correction: using '{config.f444w_col}' ({len(f444w_totals)} sources with finite flux)")
+            else:
+                print(f"WARNING: f444w_col '{config.f444w_col}' not found in catalog; falling back to Mode A")
+
         for ifilt in range(1, len(images)):
             weights_i = weights[ifilt] if weights is not None else None
 
@@ -635,6 +807,7 @@ class Pipeline:
             for t in templates:
                 assert np.all(np.isfinite(t.data)), "Templates contain NaN values"
 
+            scenes = None  # initialise; set below if run_scene_solver=True
             # @@@ split scenes here
             # Optional scene-based solver: does not alter legacy path
             if getattr(config, "run_scene_solver", False):
@@ -787,8 +960,12 @@ class Pipeline:
                 templates,
                 fluxes,
                 res,
-                psfs[ifilt] if psfs is not None else None,
                 ifilt,
+                orig_templates=self.tmpls._templates,
+                f444w_totals=f444w_totals,
+                det_image=images[0] if f444w_totals is not None else None,
+                kernel_rep=self._get_representative_kernel(kernel) if f444w_totals is not None else None,
+                scenes=scenes,
             )
 
             self.residuals.append(res)

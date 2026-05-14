@@ -91,6 +91,7 @@ class FitConfig:
     aperture_diam: float | np.ndarray | None = None  # image measurement aperture (diameter)
     aperture_catalog: float | str | None = None  # catalog aperture (diameter or table column name)
     aperture_units: str = "arcsec"  # "arcsec" or "pix"
+    f444w_col: str | None = None  # catalog column for F444W total flux (enables Yoshi Mode B correction)
 
     # Internal options: don't change unless you know what you're doing
     block_size: int = 64  # Block size for tiled processing

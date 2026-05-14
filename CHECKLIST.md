@@ -88,6 +88,7 @@ This checklist tracks tasks for building the photometry pipeline using Poetry an
 - [x] Introduced `Pipeline` class to persist images and fit results
 - [x] Consolidated catalog matching and flux extraction into helper methods
 - [x] Added aperture photometry on model+residual with PSF correction
+- [x] Added Mode B aperture correction: corr = f444w_catalog_total / aperture(PSF-matched F444W scene, r), implementing Yoshi's formula scene-by-scene with convolved F444W residual added back
 - [x] **Simulation utilities for tests** (`tests/utils.py`)
   - [x] Create fake catalogs and images with Moffat sources of varying size and ellipticity. positions are ra,dec
   - [x] Produce matching high‑res and low‑res PSFs, with low res PSF at least 5x high res PSF.
