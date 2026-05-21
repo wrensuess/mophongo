@@ -88,7 +88,7 @@ This checklist tracks tasks for building the photometry pipeline using Poetry an
 - [x] Introduced `Pipeline` class to persist images and fit results
 - [x] Consolidated catalog matching and flux extraction into helper methods
 - [x] Added aperture photometry on model+residual with PSF correction
-- [x] Added Mode B aperture correction: corr = f444w_catalog_total / aperture(PSF-matched F444W scene, r), implementing Yoshi's formula scene-by-scene with convolved F444W residual added back
+- [x] Added Mode B aperture correction: corr = f444w_catalog_total / aperture(flux_f444w_i * T_conv_i + residual_conv, r), per-source denominator using within-segmap F444W flux (tmpl.flux_f444w) + scene residual convolved to MIRI resolution
 - [x] **Simulation utilities for tests** (`tests/utils.py`)
   - [x] Create fake catalogs and images with Moffat sources of varying size and ellipticity. positions are ra,dec
   - [x] Produce matching high‑res and low‑res PSFs, with low res PSF at least 5x high res PSF.
@@ -155,6 +155,8 @@ This checklist tracks tasks for building the photometry pipeline using Poetry an
 - [ ]  wavelength dependent morphology: only where residuals are significant.
   - [ ] Add point source, if PSF not given start with marginally sampled Gaussian?  
   - [ ] add second bluer band
+- [ ] Mode B aperture correction tests needed: isolated source (corr should equal Mode A result), extended source (corr > Mode A), crowded scene (corr > Yoshi's no-subtraction equivalent)
+- [ ] Fix pre-existing off-by-one in Mode B scene bounding box: `sh = y1_sc - y0_sc` should be `y1_sc - y0_sc + 1` (bbox returns inclusive pixel indices); could clip apertures for sources near scene edge
 - [ ] stale tests in `tests/test_fit.py` — 8 tests reference old `SparseFitter` method names
         (`build_normal_matrix`, `solve_lo`, `bright_mask`, `solve_scene_shifts`) that have been
         renamed or removed. Also `test_pipeline.py::test_download_rate` hangs on MAST network call.

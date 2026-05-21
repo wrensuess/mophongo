@@ -422,6 +422,7 @@ class Template(Cutout2D):
 
         # flux
         self.flux = 0.0
+        self.flux_f444w: float = 0.0  # within-segmap F444W flux in image units (pre-normalization sum)
         self.err = 0.0
         self.err_pred = 0.0  # predicted error from weight map and profile
         self.wnorm = 0.0  # weighted norm of the template d * w * d
@@ -1011,6 +1012,7 @@ class Templates:
             # there should also never be NaNs.
             # Normalize the template so its sum is 1 (if nonzero)
             total = cut.data.sum()
+            cut.flux_f444w = float(total)
             if total != 0:
                 cut.data /= total
             else:
