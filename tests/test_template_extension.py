@@ -137,6 +137,65 @@ def test_min_size_from_aperture_even_pixel_count():
     assert Templates.min_size_from_aperture(0.8, w, margin=1.5) == 30
 
 
+# --- Step 8: Pipeline.run integration ---------------------------------------
+
+from utils import make_simple_data  # tests/utils.py helper
+from mophongo.pipeline import Pipeline
+from mophongo.fit import FitConfig
+
+
+def _pipeline_inputs():
+    images, segmap, catalog, psfs, _truth, _rms = make_simple_data(
+        seed=5, nsrc=20, size=81, ndilate=1, peak_snr=5
+    )
+    wcs = [_simple_wcs(pscale_arcsec=0.1, n=81), _simple_wcs(pscale_arcsec=0.1, n=81)]
+    weights = [np.ones_like(images[0]), np.ones_like(images[1])]
+    return images, segmap, catalog, psfs, wcs, weights
+
+
+def test_pipeline_run_extends_when_enabled():
+    """Step 8: extension is wired into Pipeline.run and sizes the cutouts."""
+    images, segmap, catalog, psfs, wcs, weights = _pipeline_inputs()
+    cfg = FitConfig(
+        extend_template_segmap=True,
+        aperture_diam=0.3,
+        aperture_units="arcsec",
+        fit_astrometry_niter=0,
+        run_scene_solver=False,
+    )
+    pl = Pipeline(
+        images, segmap, catalog=catalog, psfs=psfs, wcs=wcs,
+        kernels=[None, None], weights=weights, config=cfg,
+    )
+    cat, _resid = pl.run()
+    assert len(cat) > 0
+    # The PSF floor bumped min_size above the default 8.
+    assert pl.tmpls.min_size > 8
+    # Every flagged template is consistent (extended xor failed, never both).
+    for t in pl.tmpls._templates:
+        assert not (
+            (t.flag & Template.FLAG_PSF_EXTENDED)
+            and (t.flag & Template.FLAG_EXTEND_FAILED)
+        )
+
+
+def test_pipeline_run_no_extension_when_disabled():
+    """With the switch off, nothing is extended and min_size stays default."""
+    images, segmap, catalog, psfs, wcs, weights = _pipeline_inputs()
+    cfg = FitConfig(
+        extend_template_segmap=False,
+        fit_astrometry_niter=0,
+        run_scene_solver=False,
+    )
+    pl = Pipeline(
+        images, segmap, catalog=catalog, psfs=psfs, wcs=wcs,
+        kernels=[None, None], weights=weights, config=cfg,
+    )
+    pl.run()
+    assert pl.tmpls.min_size == 8
+    assert not any(t.flag & Template.FLAG_PSF_EXTENDED for t in pl.tmpls._templates)
+
+
 # --- Step 5: PSF-wing extension ---------------------------------------------
 
 
@@ -269,6 +328,20 @@ def test_extension_fails_when_cutout_too_small_for_wings():
     assert t.flag & Template.FLAG_EXTEND_FAILED
     assert not (t.flag & Template.FLAG_PSF_EXTENDED)
     assert t.flux_f444w == flux_before  # denominator untouched on failure
+
+
+def test_from_image_wires_extension():
+    """Step 6: from_image(extension=psf, ...) extends truncated templates."""
+    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0)
+    tmpls = Templates.from_image(
+        image, segmap, [pos], extension=psf, target_ee=0.95, min_size=40
+    )
+    t = tmpls._templates[0]
+    assert t.flag & Template.FLAG_PSF_EXTENDED
+    assert t.flux_f444w == pytest.approx(1000.0, rel=0.05)
+    # Without extension the dead parameter path stays a no-op
+    plain = Templates.from_image(image, segmap, [pos], min_size=40)
+    assert not (plain._templates[0].flag & Template.FLAG_PSF_EXTENDED)
 
 
 def test_extension_inplace_false_preserves_originals():

@@ -93,6 +93,13 @@ class FitConfig:
     aperture_units: str = "arcsec"  # "arcsec" or "pix"
     f444w_col: str | None = None  # catalog column for F444W total flux (enables Yoshi Mode B correction)
 
+    # PSF-wing extension of segmap-truncated templates (plan v3). Extends every
+    # template whose segmap is smaller than the detection PSF's target_ee area,
+    # so the Mode-B aperture correction does not blow up for compact sources.
+    extend_template_segmap: bool = True  # requires psfs[0] = detection (F444W) PSF
+    extend_template_ee: float = 0.95  # encircled-energy fraction for the size threshold
+    extend_template_min_size_margin: float = 1.5  # cutout margin for min_size sizing
+
     # Internal options: don't change unless you know what you're doing
     block_size: int = 64  # Block size for tiled processing
 

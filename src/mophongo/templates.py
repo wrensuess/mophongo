@@ -814,20 +814,29 @@ class Templates:
         segmap: np.ndarray,
         positions: Iterable[Tuple[float, float]],
         kernel: np.ndarray | None = None,
-        extension: np.ndarray | str | None = None,  # 'psf', 'wings', 'both', None
+        extension: np.ndarray | PSFRegionMap | None = None,
+        target_ee: float = 0.95,
+        min_size: int = 8,
         wcs: WCS | None = None,
     ) -> "Templates":
-        obj = cls()
+        """Build templates from a detection image.
+
+        If ``extension`` (the detection PSF, or a PSFRegionMap) is given, each
+        segmap-truncated template is extended with PSF wings before convolution
+        (see :meth:`extend_with_psf_wings`). ``min_size`` should be large enough
+        to hold those wings (see :meth:`min_size_from_aperture`).
+        """
+        obj = cls(min_size=min_size)
         obj.wcs = wcs
 
         # Step 1: Extract raw cutouts
         obj.extract_templates(hires_image, segmap, positions, wcs=wcs)
 
-        # if type(extension) == np.ndarray:
-        # Extend templates with PSF wings
-        # obj.extend_with_psf_wings(extension, inplace=True)
+        # Step 2: Extend truncated templates with PSF wings (before convolution)
+        if extension is not None:
+            obj.extend_with_psf_wings(extension, target_ee=target_ee, inplace=True)
 
-        # Step 2: Convolve with kernel (includes padding)
+        # Step 3: Convolve with kernel (includes padding)
         if kernel is not None:
             obj.convolve_templates(kernel, inplace=True)
 
@@ -1180,7 +1189,11 @@ class Templates:
         """
         is_map = isinstance(psf, PSFRegionMap)
         rep_psf = np.asarray(psf.psfs[0] if is_map else psf, dtype=float)
-        ee_area = psf_ee_area_pix(rep_psf, target_ee)
+        # Representative EE radius/area for the size threshold. For a single
+        # ndarray PSF this is also the per-source radius, so it is reused below
+        # to avoid recomputing the curve of growth for every template.
+        rep_ee_r = psf_ee_radius_pix(rep_psf, target_ee)
+        ee_area = int(np.ceil(np.pi * rep_ee_r**2))
 
         templates = self._templates if inplace else [deepcopy(t) for t in self._templates]
         for tmpl in tqdm(templates, desc="Extending with PSF wings"):
@@ -1220,7 +1233,7 @@ class Templates:
             # silently recreating the truncated-template bias this routine fixes.
             # Fail rather than corrupt; correct usage sizes the cutout via
             # min_size_from_aperture / 2 * psf_ee_radius_pix.
-            ee_r = psf_ee_radius_pix(psf_src, target_ee)
+            ee_r = rep_ee_r if not is_map else psf_ee_radius_pix(psf_src, target_ee)
             if ee_r > min(xs, nx - 1 - xs, ys, ny - 1 - ys):
                 tmpl.flag |= Template.FLAG_EXTEND_FAILED
                 continue

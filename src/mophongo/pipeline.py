@@ -724,13 +724,68 @@ class Pipeline:
             if config.f444w_col is not None and config.f444w_col in catalog.colnames:
                 cat[config.f444w_col] = catalog[config.f444w_col]
 
-        self.tmpls = Templates()
+        # --- PSF-wing extension of segmap-truncated templates (plan v3) -----
+        # Size the cutouts to hold the PSF wings *before* extraction, then extend
+        # every template whose segmap is smaller than the detection PSF's
+        # target-EE area. psfs[0] must be the detection-band (F444W = images[0])
+        # PSF; every dereference is guarded so legacy runs without PSFs are
+        # unaffected.
+        extend = bool(getattr(config, "extend_template_segmap", False))
+        detection_psf = None
+        min_size = 8
+        if extend:
+            if psfs is None or len(psfs) == 0 or psfs[0] is None or wcs is None:
+                logger.warning(
+                    "extend_template_segmap=True but psfs[0]/wcs unavailable; "
+                    "skipping PSF-wing extension."
+                )
+                extend = False
+            else:
+                detection_psf = np.asarray(psfs[0], dtype=float)
+                ee = float(config.extend_template_ee)
+                margin = float(config.extend_template_min_size_margin)
+                # Floor that holds the target-EE disk. psf_ee_radius_pix warns if
+                # a ring-negative matching kernel was passed instead of a PSF.
+                ee_r = utils.psf_ee_radius_pix(detection_psf, ee)
+                psf_floor = int(np.ceil(2.0 * ee_r + margin))
+                psf_floor += psf_floor % 2
+                min_size = max(min_size, psf_floor)
+                # Also enclose the photometry aperture when it is a scalar arcsec
+                # diameter.
+                if (
+                    isinstance(config.aperture_diam, (int, float))
+                    and config.aperture_units == "arcsec"
+                ):
+                    min_size = max(
+                        min_size,
+                        Templates.min_size_from_aperture(
+                            float(config.aperture_diam), wcs[0], margin
+                        ),
+                    )
+
+        self.tmpls = Templates(min_size=min_size)
         self.tmpls.extract_templates(
             images[0],
             segmap,
             list(zip(cat["x"], cat["y"])),
             wcs=wcs[0] if wcs is not None else None,
         )
+        if extend:
+            self.tmpls.extend_with_psf_wings(
+                detection_psf, target_ee=float(config.extend_template_ee)
+            )
+            n_ext = sum(
+                bool(t.flag & Template.FLAG_PSF_EXTENDED) for t in self.tmpls.templates
+            )
+            n_fail = sum(
+                bool(t.flag & Template.FLAG_EXTEND_FAILED) for t in self.tmpls.templates
+            )
+            logger.info(
+                "PSF-wing extension: %d extended, %d failed/skipped of %d templates",
+                n_ext,
+                n_fail,
+                len(self.tmpls.templates),
+            )
         templates = self.tmpls.templates
         for t in templates:
             assert np.all(np.isfinite(t.data)), "Templates contain NaN values"
