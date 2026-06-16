@@ -16,7 +16,6 @@ import logging
 import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
-from scipy.signal import fftconvolve
 
 from astropy.table import Table
 from astropy.wcs import WCS
@@ -155,8 +154,6 @@ class Pipeline:
     ) -> None:
         if psfs is not None and len(images) != len(psfs):
             raise ValueError("Number of images and PSFs must match")
-        if weights is None and wht_images is not None:
-            weights = wht_images
         if weights is not None and len(weights) != len(images):
             raise ValueError("Number of weight images must match number of images")
 
@@ -433,19 +430,83 @@ class Pipeline:
         if isinstance(kernel, np.ndarray) and kernel.ndim == 2:
             arr = kernel
         elif hasattr(kernel, "psfs") and len(kernel.psfs) > 0:
-            arr = kernel.psfs[len(kernel.psfs) // 2]
+            # prefer the middle element; fall back to any non-zero kernel
+            mid = len(kernel.psfs) // 2
+            n = len(kernel.psfs)
+            candidates = sorted(range(n), key=lambda i: abs(i - mid))
+            arr = next((kernel.psfs[i] for i in candidates if float(kernel.psfs[i].sum()) > 0), None)
+            if arr is None:
+                return None
         else:
             return None
         total = float(arr.sum())
         return (arr / total) if total > 0 else None
 
     def _aperture_sum_on_template(self, tmpl: Template, radius_pix: float) -> float:
-        """Exact circular aperture sum on a template, centred on the source."""
-        x0 = tmpl.input_position_cutout[0]
-        y0 = tmpl.input_position_cutout[1]
-        aper = CircularAperture((float(x0), float(y0)), r=float(radius_pix))
-        phot = aperture_photometry(tmpl.data, aper, method="exact")
+        """Exact circular aperture sum on a template, centred on the source.
+
+        Uses tmpl.data[tmpl.slices_cutout] with the source position shifted
+        into that slice's frame. This matches the geometry used for the
+        matching residual patch (residual[tmpl.slices_original]), so
+        aperture-sum linearity gives ap_flux = ap_model + res_sum exactly.
+        """
+        xc = tmpl.input_position_cutout[0] - tmpl.slices_cutout[1].start
+        yc = tmpl.input_position_cutout[1] - tmpl.slices_cutout[0].start
+        aper = CircularAperture((float(xc), float(yc)), r=float(radius_pix))
+        phot = aperture_photometry(tmpl.data[tmpl.slices_cutout], aper, method="exact")
         return float(phot["aperture_sum"][0])
+
+    def _residual_segmap_sum(
+        self,
+        residual: np.ndarray,
+        source_id: int,
+        orig_t: Template,
+        k: int,
+    ) -> float:
+        """Sum residual within (segmap == source_id), at the residual's resolution.
+
+        If the residual is at lower resolution than the segmap (k > 1), the
+        high-res segmap mask is binned down: a low-res pixel is included when
+        any high-res pixel in the corresponding k×k block belongs to the source.
+        """
+        sl_hi = orig_t.slices_original
+        mask_hi = self.segmap[sl_hi] == source_id
+        if not mask_hi.any():
+            return 0.0
+
+        if k == 1:
+            return float(residual[sl_hi][mask_hi].sum())
+
+        # Multi-resolution: bin mask_hi down to low-res. Pad so the high-res
+        # region starts and ends on k-block boundaries, then block_reduce.
+        y0_hi, x0_hi = sl_hi[0].start, sl_hi[1].start
+        y_pre = y0_hi % k
+        x_pre = x0_hi % k
+        m = np.pad(mask_hi.astype(np.uint8), ((y_pre, 0), (x_pre, 0)), constant_values=0)
+        y_post = (-m.shape[0]) % k
+        x_post = (-m.shape[1]) % k
+        if y_post or x_post:
+            m = np.pad(m, ((0, y_post), (0, x_post)), constant_values=0)
+        mask_lo = block_reduce(m, k, func=np.sum) > 0
+
+        y0_lo = (y0_hi - y_pre) // k
+        x0_lo = (x0_hi - x_pre) // k
+        sl_lo = (
+            slice(y0_lo, y0_lo + mask_lo.shape[0]),
+            slice(x0_lo, x0_lo + mask_lo.shape[1]),
+        )
+        # Clip to residual bounds
+        h_r, w_r = residual.shape
+        if sl_lo[0].stop > h_r:
+            excess = sl_lo[0].stop - h_r
+            sl_lo = (slice(sl_lo[0].start, h_r), sl_lo[1])
+            mask_lo = mask_lo[: mask_lo.shape[0] - excess, :]
+        if sl_lo[1].stop > w_r:
+            excess = sl_lo[1].stop - w_r
+            sl_lo = (sl_lo[0], slice(sl_lo[1].start, w_r))
+            mask_lo = mask_lo[:, : mask_lo.shape[1] - excess]
+
+        return float((residual[sl_lo] * mask_lo).sum())
 
     @staticmethod
     def _intersect_slices(tmpl: Template, y0: int, y1: int, x0: int, x1: int):
@@ -484,167 +545,130 @@ class Pipeline:
         fluxes: np.ndarray,
         residual: np.ndarray,
         idx: int,
+        r_orig_pix: float | None = None,
         orig_templates: list[Template] | None = None,
         f444w_totals: dict[int, float] | None = None,
-        det_image: np.ndarray | None = None,
-        kernel_rep: np.ndarray | None = None,
-        scenes: list | None = None,
     ) -> None:
-        """Measure aperture flux on (model+residual) and compute the aperture correction.
+        """Compute per-source aperture corrections (Estimator 3).
 
-        Two modes:
+        Templates are unit-sum normalised; orig_t.flux_f444w holds the
+        pre-normalisation F444W total, converting aperture fractions to real
+        flux units.
 
-        Mode A (default, f444w_totals=None):
-            corr = sum(T_conv) / aperture_sum(T_conv, r)
-            Corrects to the within-segmap template total. The sum(T_conv) in the
-            numerator cancels kernel-flux loss so the ratio is a true EE fraction.
+        ap_B_real = flux_f444w * aper(H*K, r_img)   — MIRI aperture in real units
+        ap_F_real = flux_f444w * aper(H,   r_orig)  — F444W aperture in real units
 
-        Mode B (f444w_totals provided with det_image, kernel_rep, scenes):
-            corr = f444w_total_i / aperture(flux_f444w_i * T_conv_i + residual_conv, x_i, r)
-            where flux_f444w_i = tmpl.flux_f444w (within-segmap F444W flux in image units)
-                  residual_conv = fftconvolve(det_image - within-segmap model, kernel)
-            Corrects to the Kron-based catalog total f444w_total_i. The residual
-            carries extended F444W flux outside the segmap so f444w_total_i does not
-            cancel for sources with significant extended emission.
-            Falls back to Mode A for any source missing f444w_totals.
+        With f444w_totals:   apcor = f444w_total / ap_B_real
+        Without f444w_totals: apcor = ap_F_real / ap_B_real  (PSF shape only)
 
-        Writes ap_model_{idx}, ap_flux_{idx}, ap_corr_{idx}, ap_flux_corr_{idx}.
+        ap_model     = fl * aper(H*K, r_img)          (MIRI model in aperture)
+        res_sum      = Σ_aperture(residual)           (residual within aperture)
+        res_seg      = Σ_segmap(residual)             (residual over full segmap)
+        ap_flux      = ap_model + res_sum             (observed aperture flux)
+        ap_flux_corr = ap_model * apcor + res_seg     (total: corrected model
+                                                       + residual flux outside
+                                                       the aperture, summed
+                                                       over the source segmap)
+
+        Writes ap_model_{idx}, apcor_{idx}, res_sum_{idx}, res_seg_{idx},
+        ap_flux_{idx}, ap_flux_corr_{idx}.
         """
         cfg = self.config
         id_to_row = {int(i): k for k, i in enumerate(cat["id"])}
+        r_img_pix = self._resolve_image_ap_radius_pix(idx, cfg)
 
-        for name in (f"ap_model_{idx}", f"ap_flux_{idx}", f"ap_corr_{idx}", f"ap_flux_corr_{idx}"):
+        if r_orig_pix is None:
+            pscale_img = self._pixel_scale_arcsec(self.wcs[idx] if self.wcs is not None else None)
+            pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
+            r_orig_pix = r_img_pix * pscale_img / pscale_ref if (pscale_img and pscale_ref) else r_img_pix
+
+        for name in (
+            f"ap_model_{idx}",
+            f"apcor_{idx}",
+            f"res_sum_{idx}",
+            f"res_seg_{idx}",
+            f"ap_flux_{idx}",
+            f"ap_flux_corr_{idx}",
+        ):
             if name not in cat.colnames:
                 cat[name] = cfg.bad_value
 
-        r_img_pix = self._resolve_image_ap_radius_pix(idx, cfg)
+        orig_by_id = {t.id: t for t in orig_templates} if orig_templates else {}
+        use_tcor = f444w_totals is not None
 
-        use_mode_b = (
-            f444w_totals is not None
-            and det_image is not None
-            and kernel_rep is not None
-            and scenes is not None
-            and orig_templates is not None
-        )
+        # Bin factor between the high-res segmap (F444W) and this image's
+        # residual. k=1 when shapes already match (e.g. upsample mode).
+        if self.wcs is not None and self.segmap.shape != residual.shape:
+            k = bin_factor_from_wcs(self.wcs[0], self.wcs[idx])
+        else:
+            k = 1
+
         print(
             f"  Computing aperture corrections (image {idx}, {len(templates)} sources, "
-            f"mode={'B (scale to total catalog flux)' if use_mode_b else 'A (scale to total template flux)'})"
+            f"{'with tcor_H' if use_tcor else 'apcor1 only'})"
         )
 
-        orig_by_id = {t.id: t for t in orig_templates} if orig_templates else {}
-        img_h, img_w = det_image.shape if det_image is not None else (0, 0)
+        for tmpl, fl in tqdm(zip(templates, fluxes), desc="Aperture corrections", total=len(templates)):
+            row = id_to_row.get(int(tmpl.id))
+            if row is None:
+                continue
 
-        def _ap_raw(tmpl, fl):
-            """Raw aperture flux on MIRI (model + residual patch)."""
-            patch = residual[tmpl.slices_original] + fl * tmpl.data[tmpl.slices_cutout]
+            orig_t = orig_by_id.get(tmpl.id)
+            if orig_t is None:
+                continue
+
+            flux_f444w_i = orig_t.flux_f444w
+            if flux_f444w_i <= 0:
+                continue
+
+            # Aperture fractions on normalised templates
+            ap_B_frac = self._aperture_sum_on_template(tmpl, r_img_pix)
+            if ap_B_frac <= 0:
+                continue
+
+            # Real-unit aperture fluxes (same calibration as catalog)
+            ap_B_real = flux_f444w_i * ap_B_frac
+
+            ap_model = fl * ap_B_frac
+            cat[f"ap_model_{idx}"][row] = ap_model
+
+            # Same aperture geometry as _aperture_sum_on_template — applied to
+            # the residual patch on the matched in-bounds region. By linearity
+            # ap_flux = ap_model + res_sum exactly.
             xc = tmpl.input_position_cutout[0] - tmpl.slices_cutout[1].start
             yc = tmpl.input_position_cutout[1] - tmpl.slices_cutout[0].start
-            return float(
-                aperture_photometry(patch, CircularAperture((xc, yc), r=r_img_pix), method="exact")[
-                    "aperture_sum"
-                ][0]
+            res_sum = float(
+                aperture_photometry(
+                    residual[tmpl.slices_original],
+                    CircularAperture((xc, yc), r=r_img_pix),
+                    method="exact",
+                )["aperture_sum"][0]
             )
+            cat[f"res_sum_{idx}"][row] = res_sum
+            cat[f"ap_flux_{idx}"][row] = ap_model + res_sum
 
-        def _write(row, tmpl, fl, corr):
-            if not (np.isfinite(corr) and corr > 0):
-                corr = cfg.bad_value
-            ap_raw = _ap_raw(tmpl, fl)
-            cat[f"ap_model_{idx}"][row] = fl * self._aperture_sum_on_template(tmpl, r_img_pix)
-            cat[f"ap_flux_{idx}"][row] = ap_raw
-            cat[f"ap_corr_{idx}"][row] = corr
-            cat[f"ap_flux_corr_{idx}"][row] = ap_raw * corr if np.isfinite(corr) and corr > 0 else cfg.bad_value
+            # Σ_segmap(res): residual integrated over the full segmap region.
+            # Carries the source's extended flux outside the aperture; used in
+            # ap_flux_corr so the final flux is a true total estimate.
+            res_seg = self._residual_segmap_sum(residual, int(tmpl.id), orig_t, k)
+            cat[f"res_seg_{idx}"][row] = res_seg
 
-        # ------------------------------------------------------------------ #
-        # Mode B: per-source F444W aperture correction to catalog total      #
-        # ------------------------------------------------------------------ #
-        if use_mode_b:
-            kh, kw = kernel_rep.shape
-            kpad_y = kh // 2 + 1
-            kpad_x = kw // 2 + 1
-
-            for scene in tqdm(scenes, desc="Aperture corrections"):
-                scene_tmpls = scene.templates
-
-                # Bounding box of the scene from convolved template footprints
-                y0_sc = min(t.bbox[0] for t in scene_tmpls)
-                y1_sc = max(t.bbox[1] for t in scene_tmpls)
-                x0_sc = min(t.bbox[2] for t in scene_tmpls)
-                x1_sc = max(t.bbox[3] for t in scene_tmpls)
-
-                # Padded region for residual convolution (clamped to image)
-                py0 = max(0, y0_sc - kpad_y)
-                py1 = min(img_h, y1_sc + kpad_y)
-                px0 = max(0, x0_sc - kpad_x)
-                px1 = min(img_w, x1_sc + kpad_x)
-                sh = y1_sc - y0_sc
-                sw = x1_sc - x0_sc
-
-                # Within-segmap F444W scene model in image units (orig templates × stored flux)
-                f444w_orig_model = np.zeros((py1 - py0, px1 - px0), dtype=np.float64)
-                for tmpl in scene_tmpls:
-                    orig_t = orig_by_id.get(tmpl.id)
-                    if orig_t is None:
-                        continue
-                    isect = self._intersect_slices(orig_t, py0, py1, px0, px1)
-                    if isect is None:
-                        continue
-                    pys, pxs, dys, dxs = isect
-                    f444w_orig_model[pys, pxs] += orig_t.flux_f444w * orig_t.data[dys, dxs]
-
-                # Residual carries extended flux outside segmap boundaries; convolve once per scene
-                f444w_residual = det_image[py0:py1, px0:px1].astype(np.float64) - f444w_orig_model
-                f444w_res_conv = fftconvolve(f444w_residual, kernel_rep, mode="same")
-                res_conv_scene = f444w_res_conv[y0_sc - py0: y0_sc - py0 + sh,
-                                                x0_sc - px0: x0_sc - px0 + sw]
-
-                # Per-source aperture and correction.
-                # Collect Mode B sources first so res_conv_scene can be measured in one batch call.
-                mode_b_sources = []
-                for tmpl in scene_tmpls:
-                    row = id_to_row.get(int(tmpl.id))
-                    if row is None:
-                        continue
-                    f444w_j = f444w_totals.get(int(tmpl.id))
-                    fl = tmpl.flux if hasattr(tmpl, "flux") and tmpl.flux is not None else 0.0
-                    orig_t = orig_by_id.get(tmpl.id)
-                    flux_f444w_i = orig_t.flux_f444w if orig_t is not None else 0.0
-                    if f444w_j is None or flux_f444w_i == 0:
-                        den = self._aperture_sum_on_template(tmpl, r_img_pix)
-                        tmpl_total = float(tmpl.data.sum())
-                        corr = (tmpl_total / den) if den > 0 else cfg.bad_value
-                        _write(row, tmpl, fl, corr)
-                    else:
-                        mode_b_sources.append((tmpl, row, f444w_j, fl, flux_f444w_i))
-
-                if mode_b_sources:
-                    positions = [
-                        (t.input_position_original[0] - x0_sc,
-                         t.input_position_original[1] - y0_sc)
-                        for t, *_ in mode_b_sources
-                    ]
-                    ap_res_all = np.asarray(aperture_photometry(
-                        res_conv_scene,
-                        CircularAperture(positions, r=r_img_pix),
-                        method="exact",
-                    )["aperture_sum"])
-
-                    for (tmpl, row, f444w_j, fl, flux_f444w_i), ap_res in zip(mode_b_sources, ap_res_all):
-                        ap_denom = flux_f444w_i * self._aperture_sum_on_template(tmpl, r_img_pix) + float(ap_res)
-                        corr = (f444w_j / ap_denom) if ap_denom > 0 else cfg.bad_value
-                        _write(row, tmpl, fl, corr)
-
-        # ------------------------------------------------------------------ #
-        # Mode A: template-normalised correction                              #
-        # ------------------------------------------------------------------ #
-        else:
-            for tmpl, fl in tqdm(zip(templates, fluxes), desc="Aperture corrections", total=len(templates)):
-                row = id_to_row.get(int(tmpl.id))
-                if row is None:
+            if use_tcor:
+                f444w_total = f444w_totals.get(int(tmpl.id))
+                if f444w_total is not None and np.isfinite(f444w_total):
+                    apcor = f444w_total / ap_B_real
+                    cat[f"apcor_{idx}"][row] = apcor
+                    cat[f"ap_flux_corr_{idx}"][row] = ap_model * apcor + res_seg
                     continue
-                den = self._aperture_sum_on_template(tmpl, r_img_pix)
-                tmpl_total = float(tmpl.data.sum())
-                corr = (tmpl_total / den) if den > 0 else cfg.bad_value
-                _write(row, tmpl, fl, corr)
+
+            # Without catalog total: PSF shape correction only
+            ap_F_frac = self._aperture_sum_on_template(orig_t, r_orig_pix)
+            if ap_F_frac <= 0:
+                continue
+            ap_F_real = flux_f444w_i * ap_F_frac
+            apcor = ap_F_real / ap_B_real
+            cat[f"apcor_{idx}"][row] = apcor
+            cat[f"ap_flux_corr_{idx}"][row] = ap_model * apcor + res_seg
 
     def run(self, config: FitConfig | None = None) -> tuple[Table, list[np.ndarray]]:
         """Run photometry on the configured images.
@@ -943,9 +967,6 @@ class Pipeline:
                 ifilt,
                 orig_templates=self.tmpls._templates,
                 f444w_totals=f444w_totals,
-                det_image=images[0] if f444w_totals is not None else None,
-                kernel_rep=self._get_representative_kernel(kernel) if f444w_totals is not None else None,
-                scenes=scenes,
             )
 
             self.residuals.append(res)

@@ -156,7 +156,9 @@ This checklist tracks tasks for building the photometry pipeline using Poetry an
   - [ ] Add point source, if PSF not given start with marginally sampled Gaussian?  
   - [ ] add second bluer band
 - [ ] Mode B aperture correction tests needed: isolated source (corr should equal Mode A result), extended source (corr > Mode A), crowded scene (corr > Yoshi's no-subtraction equivalent)
-- [ ] Fix pre-existing off-by-one in Mode B scene bounding box: `sh = y1_sc - y0_sc` should be `y1_sc - y0_sc + 1` (bbox returns inclusive pixel indices); could clip apertures for sources near scene edge
+- [x] Fix pre-existing off-by-one in Mode B scene bounding box: closed by the Mode B aperture
+        rework. The aperture path uses half-open `slices_original`/`slices_cutout` directly and
+        `Scene.model_image` uses `bb[1]-bb[0]+1`; no inclusive-bbox shape math remains in that path.
 - [ ] stale tests in `tests/test_fit.py` — 8 tests reference old `SparseFitter` method names
         (`build_normal_matrix`, `solve_lo`, `bright_mask`, `solve_scene_shifts`) that have been
         renamed or removed. Also `test_pipeline.py::test_download_rate` hangs on MAST network call.

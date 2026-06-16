@@ -87,6 +87,66 @@ def downsample_psf(psf: np.ndarray, k: int) -> np.ndarray:
     return block_reduce(psf, k, func=np.sum)
 
 
+def psf_ee_radius_pix(psf: np.ndarray, ee_fraction: float = 0.95) -> float:
+    """Radius in pixels enclosing ``ee_fraction`` of ``psf.sum()``.
+
+    Wraps :class:`photutils.profiles.CurveOfGrowth` and normalises the curve by
+    ``psf.sum()`` (the true total), so the returned radius encloses a fraction
+    of the *full* PSF flux rather than the flux within the largest aperture.
+
+    The cumulative profile is built on ``psf`` exactly as given -- no ``abs``,
+    no ``clip`` -- because matched-PSF kernels can ring negative and clipping
+    would distort the curve. Callers must therefore pass a positive PSF/kernel
+    (the detection PSF, in the template-extension path). A warning is emitted if
+    the input has significant negative pixels, where the curve may be
+    non-monotonic and the interpolation unreliable.
+
+    Parameters
+    ----------
+    psf : np.ndarray
+        2-D PSF centred at ``(shape - 1) / 2``.
+    ee_fraction : float
+        Target encircled-energy fraction in ``(0, 1)``.
+
+    Returns
+    -------
+    float
+        Radius in pixels at which the encircled energy crosses ``ee_fraction``.
+    """
+    psf = np.asarray(psf, dtype=float)
+    total = float(psf.sum())
+    if total <= 0:
+        raise ValueError("psf.sum() must be positive to define encircled energy")
+    if psf.min() < -1e-6 * psf.max():
+        logger.warning(
+            "psf_ee_radius_pix: input has significant negative pixels; the "
+            "curve of growth may be non-monotonic and the EE radius unreliable. "
+            "Pass a positive PSF/kernel."
+        )
+
+    ny, nx = psf.shape
+    xc, yc = (nx - 1) / 2.0, (ny - 1) / 2.0
+    r_max = min(xc, yc)
+    if r_max < 1:
+        raise ValueError("psf too small to measure an encircled-energy radius")
+    radii = np.arange(0.5, r_max, 0.5)
+
+    cog = CurveOfGrowth(psf, (xc, yc), radii)
+    frac = cog.profile / total
+    return float(np.interp(ee_fraction, frac, cog.radius))
+
+
+def psf_ee_area_pix(psf: np.ndarray, ee_fraction: float = 0.95) -> int:
+    """Area in pixels of the circle enclosing ``ee_fraction`` of ``psf.sum()``.
+
+    Returns ``ceil(pi * r**2)`` where ``r`` is :func:`psf_ee_radius_pix`. Used
+    as the segmap-size threshold below which a template is too truncated to be a
+    faithful PSF shape and is a candidate for PSF-wing extension.
+    """
+    r = psf_ee_radius_pix(psf, ee_fraction)
+    return int(np.ceil(np.pi * r * r))
+
+
 def bin_factor_from_wcs(w_det: WCS, w_img: WCS, tol: float = 0.001) -> int:
     """Return the integer pixel-scale factor between two WCS objects.
 
