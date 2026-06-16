@@ -1200,6 +1200,7 @@ class Templates:
         # to avoid recomputing the curve of growth for every template.
         rep_ee_r = psf_ee_radius_pix(rep_psf, target_ee)
         ee_area = int(np.ceil(np.pi * rep_ee_r**2))
+        ee_r_cache: dict[int, float] = {}  # per-region EE radius (map path)
 
         templates = self._templates if inplace else [deepcopy(t) for t in self._templates]
         for tmpl in tqdm(templates, desc="Extending with PSF wings"):
@@ -1219,8 +1220,10 @@ class Templates:
                 else:
                     ra, dec = x, y
                 psf_src = psf.get_psf(ra, dec)
+                region_key = id(psf_src)  # get_psf returns a stable per-region array
             else:
                 psf_src = rep_psf
+                region_key = None
             if psf_src is None:
                 tmpl.flag |= Template.FLAG_EXTEND_FAILED
                 continue
@@ -1239,7 +1242,13 @@ class Templates:
             # silently recreating the truncated-template bias this routine fixes.
             # Fail rather than corrupt; correct usage sizes the cutout via
             # min_size_from_aperture / 2 * psf_ee_radius_pix.
-            ee_r = rep_ee_r if not is_map else psf_ee_radius_pix(psf_src, target_ee)
+            if not is_map:
+                ee_r = rep_ee_r
+            else:
+                ee_r = ee_r_cache.get(region_key)
+                if ee_r is None:
+                    ee_r = psf_ee_radius_pix(psf_src, target_ee)
+                    ee_r_cache[region_key] = ee_r
             if ee_r > min(xs, nx - 1 - xs, ys, ny - 1 - ys):
                 tmpl.flag |= Template.FLAG_EXTEND_FAILED
                 continue

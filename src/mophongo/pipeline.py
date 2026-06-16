@@ -741,12 +741,22 @@ class Pipeline:
                 )
                 extend = False
             else:
-                detection_psf = np.asarray(psfs[0], dtype=float)
+                # The detection PSF may be a single ndarray or a spatially
+                # varying PSFRegionMap; extend_with_psf_wings handles both.
+                detection_psf = psfs[0]
                 ee = float(config.extend_template_ee)
                 margin = float(config.extend_template_min_size_margin)
                 # Floor that holds the target-EE disk. psf_ee_radius_pix warns if
                 # a ring-negative matching kernel was passed instead of a PSF.
-                ee_r = utils.psf_ee_radius_pix(detection_psf, ee)
+                # For a region map, size for the widest region so every source
+                # has room (others may still FLAG_EXTEND_FAILED, never clip).
+                if isinstance(detection_psf, PSFRegionMap):
+                    ee_r = max(
+                        utils.psf_ee_radius_pix(np.asarray(p, dtype=float), ee)
+                        for p in detection_psf.psfs
+                    )
+                else:
+                    ee_r = utils.psf_ee_radius_pix(np.asarray(detection_psf, dtype=float), ee)
                 # Use ceil(ee_r) so the cutout half-extent clears the EE radius
                 # with integer headroom: extend_with_psf_wings fails a source
                 # whose EE disk does not fit, and at integer ee_r a tight floor

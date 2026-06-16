@@ -337,6 +337,27 @@ def test_extension_fails_when_cutout_too_small_for_wings():
     assert t.flux_f444w == flux_before  # denominator untouched on failure
 
 
+def test_extension_with_psfregionmap():
+    """Detection PSF may be a PSFRegionMap (production passes one, not an ndarray)."""
+    import geopandas as gpd
+    from shapely.geometry import box
+    from mophongo.psf_map import PSFRegionMap
+
+    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0, n=121)
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0], "geometry": [box(149, 1, 151, 3)]}, crs="EPSG:4326"
+    )
+    prm = PSFRegionMap(regions=regions, psfs=np.array([psf]))
+
+    tmpls = Templates(min_size=40)
+    tmpls.extract_templates(image, segmap, [pos], wcs=_simple_wcs(pscale_arcsec=0.1, n=121))
+    tmpls.extend_with_psf_wings(prm, target_ee=0.95, inplace=True)
+    t = tmpls._templates[0]
+    assert t.flag & Template.FLAG_PSF_EXTENDED
+    assert t.flux_f444w == pytest.approx(1000.0, rel=0.05)
+    assert t.data.sum() == pytest.approx(1.0, rel=1e-6)
+
+
 def test_from_image_wires_extension():
     """Step 6: from_image(extension=psf, ...) extends truncated templates."""
     image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0)
