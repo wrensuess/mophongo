@@ -703,6 +703,12 @@ class Template(Cutout2D):
         # print(dx, dy, ly, lx)
         low.data[:ly, :lx] = lo_block
 
+        # Carry source metadata to the low-res template, mirroring
+        # convolve_cutout (block_reduce conserves flux, so flux_f444w is valid).
+        low.flux_f444w = self.flux_f444w
+        low.n_pix = self.n_pix
+        low.flag |= self.flag & (Template.FLAG_PSF_EXTENDED | Template.FLAG_EXTEND_FAILED)
+
         return low
 
 
@@ -1261,9 +1267,19 @@ class Templates:
             paste = (~seg) & within
             data[paste] += s * psf_cut[paste]
 
-            # Raise flux_f444w to the inferred total (uncropped PSF), so the
-            # Mode-B denominator relaxes. Updated on this template object, which
-            # is the original when inplace=True.
+            # Re-normalise to unit sum so the template keeps the convention the
+            # aperture code relies on -- aper(T, r) is a *fraction* of a unit-sum
+            # template (see _aperture_sum_on_template). The raised flux_f444w
+            # below carries the absolute scale. Without this, the Mode-A ap_F_frac,
+            # read off the un-convolved original, would be inflated by the pasted
+            # wing flux. (Mode-B reads ap_B_frac off the convolved template, which
+            # convolve_cutout already re-normalises, so it is unaffected either way.)
+            total = float(data.sum())
+            if total > 0:
+                data /= total
+
+            # Raise flux_f444w to the inferred total (uncropped PSF). Updated on
+            # this template object, which is the original when inplace=True.
             tmpl.flux_f444w = tmpl.flux_f444w / f_seg
             tmpl.flag |= Template.FLAG_PSF_EXTENDED
 

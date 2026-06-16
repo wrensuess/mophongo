@@ -747,13 +747,18 @@ class Pipeline:
                 # Floor that holds the target-EE disk. psf_ee_radius_pix warns if
                 # a ring-negative matching kernel was passed instead of a PSF.
                 ee_r = utils.psf_ee_radius_pix(detection_psf, ee)
-                psf_floor = int(np.ceil(2.0 * ee_r + margin))
+                # Use ceil(ee_r) so the cutout half-extent clears the EE radius
+                # with integer headroom: extend_with_psf_wings fails a source
+                # whose EE disk does not fit, and at integer ee_r a tight floor
+                # would sit exactly on that boundary.
+                psf_floor = 2 * int(np.ceil(ee_r)) + int(np.ceil(margin))
                 psf_floor += psf_floor % 2
                 min_size = max(min_size, psf_floor)
                 # Also enclose the photometry aperture when it is a scalar arcsec
-                # diameter.
+                # diameter (np scalars included; per-source ndarray apertures skip).
                 if (
-                    isinstance(config.aperture_diam, (int, float))
+                    np.isscalar(config.aperture_diam)
+                    and not isinstance(config.aperture_diam, str)
                     and config.aperture_units == "arcsec"
                 ):
                     min_size = max(

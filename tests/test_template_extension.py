@@ -171,12 +171,16 @@ def test_pipeline_run_extends_when_enabled():
     assert len(cat) > 0
     # The PSF floor bumped min_size above the default 8.
     assert pl.tmpls.min_size > 8
-    # Every flagged template is consistent (extended xor failed, never both).
     for t in pl.tmpls._templates:
+        # Every flagged template is consistent (extended xor failed, never both).
         assert not (
             (t.flag & Template.FLAG_PSF_EXTENDED)
             and (t.flag & Template.FLAG_EXTEND_FAILED)
         )
+        # Invariant the apcor code relies on: hires templates stay unit-sum even
+        # after wing extension (the raised flux_f444w carries the scale).
+        if t.data.sum() != 0:
+            assert t.data.sum() == pytest.approx(1.0, rel=1e-6)
 
 
 def test_pipeline_run_no_extension_when_disabled():
@@ -230,6 +234,9 @@ def test_extension_raises_flux_f444w_to_inferred_total():
     assert t.flux_f444w == pytest.approx(total_flux, rel=0.05)
     # flux was actually pasted outside the original segment
     assert (t.data[~(t.data == 0)]).size > 0
+    # Invariant: the template stays unit-sum (aperture code reads aper(T) as a
+    # *fraction*); the raised flux_f444w carries the absolute scale.
+    assert t.data.sum() == pytest.approx(1.0, rel=1e-6)
 
 
 def test_extension_makes_template_psf_shaped():
