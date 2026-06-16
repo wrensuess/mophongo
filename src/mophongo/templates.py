@@ -11,9 +11,11 @@ from photutils.segmentation import SegmentationImage
 from tqdm import tqdm
 from scipy.signal import fftconvolve
 from scipy.interpolate import interp1d
+from scipy.ndimage import map_coordinates
 from astropy.nddata import block_reduce
+from astropy.wcs.utils import proj_plane_pixel_scales
 
-from .utils import measure_shape, bin_remap
+from .utils import measure_shape, bin_remap, psf_ee_radius_pix, psf_ee_area_pix
 from .psf_map import PSFRegionMap
 
 logger = logging.getLogger(__name__)
@@ -707,10 +709,41 @@ class Template(Cutout2D):
 class Templates:
     """Container for source templates."""
 
-    min_size = 8  # minimum size of a template in pixels
-
-    def __init__(self) -> None:
+    def __init__(self, min_size: int = 8) -> None:
+        # Minimum (even) cutout size in pixels. extract_templates enforces it as
+        # ``(min_size // 2) * 2``, so an odd value would lose a pixel; callers
+        # that size for PSF wings should pass an even floor (see
+        # min_size_from_aperture).
+        self.min_size = int(min_size)
         self._templates: List[Template] = []
+
+    @staticmethod
+    def min_size_from_aperture(
+        aperture_diam_arcsec: float, wcs: WCS, margin: float = 1.5
+    ) -> int:
+        """Smallest even cutout size (pixels) enclosing a photometry aperture.
+
+        Parameters
+        ----------
+        aperture_diam_arcsec : float
+            Photometry aperture diameter in arcsec.
+        wcs : astropy.wcs.WCS
+            WCS of the high-res (detection) image, for the pixel scale.
+        margin : float
+            Multiplicative margin on the aperture diameter (default 1.5).
+
+        Returns
+        -------
+        int
+            Even pixel count; rounded up so the (min_size // 2) * 2 floor in
+            extract_templates does not drop a pixel.
+        """
+        # Use the finer axis (smallest arcsec/pixel) so the square cutout floor
+        # contains the aperture on both axes when pixels are non-square.
+        pscale_arcsec = float(np.min(proj_plane_pixel_scales(wcs))) * 3600.0
+        diam_pix = aperture_diam_arcsec / pscale_arcsec
+        size = int(np.ceil(diam_pix * margin))
+        return size + (size % 2)
 
     def __len__(self) -> int:
         return len(self._templates)
@@ -1102,61 +1135,126 @@ class Templates:
         return new_templates if not inplace else self._templates
 
     def extend_with_psf_wings(
-        self, psf: np.ndarray, *, radius_factor: float = 1.5, inplace: bool = False
+        self,
+        psf: np.ndarray | PSFRegionMap,
+        *,
+        target_ee: float = 0.95,
+        inplace: bool = True,
     ) -> List[Template]:
-        """Extend templates using PSF scaled to segment flux, placed where template is zero.
+        """Extend segmap-truncated templates with scaled PSF wings.
 
-        Note: rewritten in a later step to gate on segmap size, use bilinear
-        PSF sampling, and update ``flux_f444w``. The body below is the original
-        (now dead) implementation, retained only so the method is in the class.
+        A template whose segmap captures only a small fraction of the PSF (small
+        ``n_pix``) is a poor shape model because it is missing the PSF wings. For
+        every template with ``0 < n_pix < ee_area`` -- where ``ee_area`` is the
+        ``target_ee`` encircled-energy area of the detection PSF -- the PSF,
+        scaled to the in-segment flux, is pasted into the pixels outside the
+        segment (within the ``target_ee`` radius), making the template a faithful
+        PSF shape. Templates with an adequate segmap (``n_pix >= ee_area``) and
+        empty templates (``n_pix == 0``) are left untouched.
+
+        Flux bookkeeping. ``flux_f444w`` (the within-segmap detection flux that the
+        Mode-B aperture-correction loop reads off the original template) is updated
+        to the inferred total ``flux_f444w / f_seg``, where ``f_seg`` is the
+        fraction of the PSF flux that falls in the segment. This is derived from
+        the full (uncropped) PSF, so the EE-crop applied to the pasted pixels --
+        which only bounds the added array footprint -- does not bias the
+        denominator low. The matching/convolution PSF elsewhere is not cropped by
+        this routine.
+
+        Parameters
+        ----------
+        psf : np.ndarray or PSFRegionMap
+            Detection-band PSF (e.g. F444W). For a PSFRegionMap the per-source PSF
+            is looked up by sky position, mirroring :meth:`convolve_templates`; the
+            size threshold uses the map's first (representative) PSF.
+        target_ee : float
+            Encircled-energy fraction setting the size threshold and the radius to
+            which the pasted PSF is cropped.
+        inplace : bool
+            If True (default) modify and return the stored templates, avoiding a
+            peak-memory copy. Otherwise operate on deep copies.
+
+        Returns
+        -------
+        list of Template
         """
+        is_map = isinstance(psf, PSFRegionMap)
+        rep_psf = np.asarray(psf.psfs[0] if is_map else psf, dtype=float)
+        ee_area = psf_ee_area_pix(rep_psf, target_ee)
 
-        psf = psf / psf.sum()
-        new_templates: list[Template] = []
+        templates = self._templates if inplace else [deepcopy(t) for t in self._templates]
+        for tmpl in tqdm(templates, desc="Extending with PSF wings"):
+            # Idempotency: never re-process an already-handled template -- on a
+            # second pass (or post-convolution) ``data > 0`` would include the
+            # pasted wings and re-inflate flux_f444w.
+            if tmpl.flag & (Template.FLAG_PSF_EXTENDED | Template.FLAG_EXTEND_FAILED):
+                continue
+            if not (0 < tmpl.n_pix < ee_area):
+                continue
 
-        # Add progress bar here
-        for i, tmpl in enumerate(tqdm(self._templates, desc="Extending with PSF wings")):
+            # Per-source detection PSF (mirror convolve_templates for a map)
+            if is_map:
+                x, y = tmpl.position_original
+                if tmpl.wcs is not None:
+                    ra, dec = tmpl.wcs.wcs_pix2world(x, y, 0)
+                else:
+                    ra, dec = x, y
+                psf_src = psf.get_psf(ra, dec)
+            else:
+                psf_src = rep_psf
+            if psf_src is None:
+                tmpl.flag |= Template.FLAG_EXTEND_FAILED
+                continue
+            psf_src = np.asarray(psf_src, dtype=float)
+            psf_total = float(psf_src.sum())
+            if psf_total <= 0:
+                tmpl.flag |= Template.FLAG_EXTEND_FAILED
+                continue
+
             data = tmpl.data
             ny, nx = data.shape
+            xs, ys = tmpl.input_position_cutout  # float source position (x, y)
 
-            # Measure shape to determine padding needed
-            x_c, y_c, sigma_x, sigma_y, theta = measure_shape(data, data != 0)
-            effective_radius = max(sigma_x, sigma_y)
+            # The target-EE disk must fit inside the cutout. Otherwise the pasted
+            # wings clip at the edge while flux_f444w is raised to the full total,
+            # silently recreating the truncated-template bias this routine fixes.
+            # Fail rather than corrupt; correct usage sizes the cutout via
+            # min_size_from_aperture / 2 * psf_ee_radius_pix.
+            ee_r = psf_ee_radius_pix(psf_src, target_ee)
+            if ee_r > min(xs, nx - 1 - xs, ys, ny - 1 - ys):
+                tmpl.flag |= Template.FLAG_EXTEND_FAILED
+                continue
 
-            # Calculate padding based on radius factor
-            pad_radius = int(np.ceil(effective_radius * radius_factor))
-            pady, padx = int(ny * (radius_factor - 1)), int(nx * (radius_factor - 1))
+            # Bilinear-sample the PSF onto the cutout grid at the sub-pixel
+            # source position; normalise so it sums to the PSF flux fraction.
+            yy, xx = np.mgrid[0:ny, 0:nx]
+            pcy = (psf_src.shape[0] - 1) / 2.0
+            pcx = (psf_src.shape[1] - 1) / 2.0
+            coords = np.array([pcy + (yy - ys), pcx + (xx - xs)])
+            psf_cut = map_coordinates(psf_src, coords, order=1, mode="constant", cval=0.0)
+            psf_cut /= psf_total
 
-            # Pad the template
-            new_tmpl = tmpl.pad((pady, padx), self.original_shape, inplace=inplace)
+            # Segment footprint captured before pasting.
+            seg = data > 0
+            f_seg = float(psf_cut[seg].sum())  # PSF fraction in the segment
+            if f_seg < 1e-8:  # negligible overlap -> cannot scale reliably
+                tmpl.flag |= Template.FLAG_EXTEND_FAILED
+                continue
 
-            # Sample PSF at all template positions
-            nh, nw = new_tmpl.data.shape
-            psf_template = self._sample_psf(psf, new_tmpl.position_cutout, nh, nw)
+            # Scale so the PSF's in-segment sum matches the template's, then paste
+            # the wings outside the segment within the target-EE radius, in place.
+            s = float(data[seg].sum()) / f_seg
+            within = (xx - xs) ** 2 + (yy - ys) ** 2 <= ee_r**2
+            paste = (~seg) & within
+            data[paste] += s * psf_cut[paste]
 
-            # Create mask for segment pixels in the padded template
-            # Calculate scaling using only segment pixels
-            segment_mask = new_tmpl.data > 0
-            data_in_segment = np.sum(new_tmpl.data[segment_mask])
-            psf_in_segment = np.sum(psf_template[segment_mask])
+            # Raise flux_f444w to the inferred total (uncropped PSF), so the
+            # Mode-B denominator relaxes. Updated on this template object, which
+            # is the original when inplace=True.
+            tmpl.flux_f444w = tmpl.flux_f444w / f_seg
+            tmpl.flag |= Template.FLAG_PSF_EXTENDED
 
-            if psf_in_segment > 0:
-                psf_scale = data_in_segment / psf_in_segment
-            else:
-                psf_scale = 0.0
-
-            # Add PSF flux only where the template is currently zero
-            # if inplace, this will modify the original template
-            new_tmpl.data[~segment_mask] += psf_template[~segment_mask] * psf_scale
-
-            # Update the output templates list if not inplace
-            if not inplace:
-                new_templates.append(new_tmpl)
-
-        if not inplace:
-            return new_templates
-        else:
-            return self._templates
+        return templates
 
 
 # ---------------------------------------------------- obsolete methods -------------------

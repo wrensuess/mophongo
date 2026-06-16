@@ -45,7 +45,7 @@ def test_template_extension_methods(tmp_path):
 #    templates = tmpl.convolve_templates(kernel, inplace=False)
 
     templates_psf = tmpl.extend_with_psf_wings(psf_hi.array,
-                                              radius_factor=1.5,
+                                              target_ee=0.95,
                                               inplace=False)
 
     fname_moff = tmp_path / "extension_psf.png"

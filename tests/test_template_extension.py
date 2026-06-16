@@ -108,3 +108,181 @@ def test_convolve_propagates_n_pix_and_flags_even_when_sum_zero():
     assert conv_zero.flag & Template.FLAG_SUM_ZERO
     assert conv_zero.n_pix == 3
     assert conv_zero.flag & Template.FLAG_EXTEND_FAILED
+
+
+# --- Step 4: aperture-derived min_size --------------------------------------
+
+from astropy.wcs import WCS
+
+
+def _simple_wcs(pscale_arcsec: float = 0.04, n: int = 101) -> WCS:
+    w = WCS(naxis=2)
+    w.wcs.crpix = [n / 2, n / 2]
+    w.wcs.cdelt = [-pscale_arcsec / 3600.0, pscale_arcsec / 3600.0]
+    w.wcs.crval = [150.0, 2.0]
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    return w
+
+
+def test_min_size_is_instance_attribute():
+    assert Templates().min_size == 8  # default preserves prior behaviour
+    assert Templates(min_size=20).min_size == 20
+
+
+def test_min_size_from_aperture_even_pixel_count():
+    w = _simple_wcs(pscale_arcsec=0.04)
+    # 0.4" / 0.04"/pix = 10 pix; *1.5 margin = 15 -> rounded up to even = 16
+    assert Templates.min_size_from_aperture(0.4, w, margin=1.5) == 16
+    # scales with aperture diameter
+    assert Templates.min_size_from_aperture(0.8, w, margin=1.5) == 30
+
+
+# --- Step 5: PSF-wing extension ---------------------------------------------
+
+
+def _point_source_scene(total_flux=1000.0, sigma=3.0, n=121, seg_frac=0.5):
+    """Image of a single Gaussian point source and a core-only segmap.
+
+    The segmap thresholds the PSF at ``seg_frac`` of the peak, so it captures
+    only the bright core (small n_pix), reproducing the truncated-template
+    failure mode.
+    """
+    psf = _gaussian_psf(n=n, sigma=sigma)  # sums to 1
+    image = total_flux * psf
+    segmap = (image > seg_frac * image.max()).astype(int)  # label 1 core
+    pos = ((n - 1) / 2.0, (n - 1) / 2.0)
+    return image, segmap, psf, pos
+
+
+def test_extension_raises_flux_f444w_to_inferred_total():
+    """flux_f444w should relax to ~the true total after extension (Blocker B2)."""
+    total_flux = 1000.0
+    image, segmap, psf, pos = _point_source_scene(total_flux=total_flux, sigma=3.0)
+
+    tmpls = Templates(min_size=40)  # room for the wings
+    tmpls.extract_templates(image, segmap, [pos])
+    t = tmpls._templates[0]
+    seg_flux = t.flux_f444w
+    assert seg_flux < 0.8 * total_flux  # truncated: segmap holds only the core
+
+    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
+    assert t.flag & Template.FLAG_PSF_EXTENDED
+    # inferred total ~ the true source flux
+    assert t.flux_f444w == pytest.approx(total_flux, rel=0.05)
+    # flux was actually pasted outside the original segment
+    assert (t.data[~(t.data == 0)]).size > 0
+
+
+def test_extension_makes_template_psf_shaped():
+    """After extension the (unit-summed) core matches a clean PSF cutout."""
+    image, segmap, psf, pos = _point_source_scene(sigma=3.0, n=121)
+    tmpls = Templates(min_size=40)
+    tmpls.extract_templates(image, segmap, [pos])
+    t = tmpls._templates[0]
+
+    before_outside = float(t.data[t.data == 0].size)
+    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
+    # fewer zero pixels: wings now fill part of the previously-empty region
+    after_zeros = float((t.data == 0).sum())
+    assert after_zeros < before_outside
+
+
+def test_extension_skips_adequate_segmap():
+    """A source whose segmap already exceeds ee_area is left untouched."""
+    # Low threshold -> segmap captures most of the PSF (large n_pix >= ee_area)
+    image, segmap, psf, pos = _point_source_scene(sigma=3.0, n=121, seg_frac=0.001)
+    tmpls = Templates(min_size=40)
+    tmpls.extract_templates(image, segmap, [pos])
+    t = tmpls._templates[0]
+    ee_area = psf_ee_area_pix(psf, 0.95)
+    assert t.n_pix >= ee_area
+
+    before = t.data.copy()
+    flux_before = t.flux_f444w
+    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
+    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
+    assert t.flux_f444w == flux_before
+    np.testing.assert_array_equal(t.data, before)
+
+
+def test_extension_skips_empty_template():
+    """n_pix == 0 (e.g. FLAG_SUM_ZERO) is never extended."""
+    t = Template(np.zeros((40, 40)), (20, 20), (40, 40), label=1)
+    t.n_pix = 0
+    tmpls = Templates()
+    tmpls._templates = [t]
+    tmpls.extend_with_psf_wings(_gaussian_psf(sigma=3.0), inplace=True)
+    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
+
+
+def test_extension_zero_overlap_guard_sets_failed_flag():
+    """If the PSF has negligible overlap with the segment, flag and skip."""
+    n = 41
+    data = np.zeros((n, n))
+    data[0:3, 0:3] = 1.0  # segment in the corner
+
+    # Source position at the centre, far from the corner segment; a narrow PSF
+    # sampled at the centre is ~0 over the corner -> f_seg ~ 0.
+    t = Template(data, (20, 20), (n, n), label=1)
+    t.n_pix = 9
+    tmpls = Templates()
+    tmpls._templates = [t]
+
+    narrow_psf = _gaussian_psf(n=41, sigma=1.0)
+    ee_area = psf_ee_area_pix(narrow_psf, 0.95)
+    assert 0 < t.n_pix < ee_area  # passes the size gate, so the guard is exercised
+
+    tmpls.extend_with_psf_wings(narrow_psf, target_ee=0.95, inplace=True)
+    assert t.flag & Template.FLAG_EXTEND_FAILED
+    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
+
+
+def test_extension_is_idempotent():
+    """A second call must not re-inflate flux_f444w (guarded by the flag)."""
+    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0)
+    tmpls = Templates(min_size=40)
+    tmpls.extract_templates(image, segmap, [pos])
+    t = tmpls._templates[0]
+
+    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
+    flux_once = t.flux_f444w
+    data_once = t.data.copy()
+    assert t.flag & Template.FLAG_PSF_EXTENDED
+
+    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
+    assert t.flux_f444w == flux_once
+    np.testing.assert_array_equal(t.data, data_once)
+
+
+def test_extension_fails_when_cutout_too_small_for_wings():
+    """If the EE disk does not fit in the cutout, fail instead of clipping."""
+    # Default min_size=8 -> ~8px cutout, far smaller than the sigma=3 EE radius.
+    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0)
+    tmpls = Templates()  # min_size=8
+    tmpls.extract_templates(image, segmap, [pos])
+    t = tmpls._templates[0]
+    ee_area = psf_ee_area_pix(psf, 0.95)
+    assert 0 < t.n_pix < ee_area  # passes the size gate
+    flux_before = t.flux_f444w
+
+    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
+    assert t.flag & Template.FLAG_EXTEND_FAILED
+    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
+    assert t.flux_f444w == flux_before  # denominator untouched on failure
+
+
+def test_extension_inplace_false_preserves_originals():
+    image, segmap, psf, pos = _point_source_scene(sigma=3.0, n=121)
+    tmpls = Templates(min_size=40)
+    tmpls.extract_templates(image, segmap, [pos])
+    orig = tmpls._templates[0]
+    orig_flux = orig.flux_f444w
+    orig_data = orig.data.copy()
+
+    out = tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=False)
+    assert out[0] is not orig
+    # originals untouched
+    assert orig.flux_f444w == orig_flux
+    np.testing.assert_array_equal(orig.data, orig_data)
+    # the returned copy was extended
+    assert out[0].flag & Template.FLAG_PSF_EXTENDED
