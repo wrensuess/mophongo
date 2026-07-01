@@ -93,11 +93,30 @@ class FitConfig:
     aperture_units: str = "arcsec"  # "arcsec" or "pix"
     f444w_col: str | None = None  # catalog column for F444W total flux (enables Yoshi Mode B correction)
 
-    # PSF-wing extension of segmap-truncated templates (plan v3). Extends every
-    # template whose segmap is smaller than the detection PSF's target_ee area,
-    # so the Mode-B aperture correction does not blow up for compact sources.
-    extend_template_segmap: bool = True  # requires psfs[0] = detection (F444W) PSF
-    extend_template_ee: float = 0.95  # encircled-energy fraction for the size threshold
+    # Template extension beyond the segmap (Estimator-3). Each source's composite
+    # template H is extended beyond the segmentation isophote so the aperture
+    # correction (apcor1 = apF/apB) does not blow up for segmap-truncated sources.
+    # A single "auto" mode chooses per source from its in-segment SNR (snr_seg) and
+    # its owned-wings SNR (snr_wings, integrated out to the measurement aperture):
+    #   FAINT (snr_seg < 1.5*fit_snrlo_psf): blend the core with the detection-PSF
+    #         model in quadrature (-> clean PSF) + PSF wings to the 95% EE radius.
+    #   BRIGHT & EXTENDED (snr_wings > wings_snr_psf): real detection data over the
+    #         source's owned pixels.
+    #   BRIGHT & COMPACT  (snr_wings <= wings_snr_psf): real-data core + PSF wings.
+    # Requires psfs[0]; falls back to truncated templates with a warning if the
+    # detection PSF/WCS is absent.
+    template_extend_mode: str = "auto"  # "none" | "auto"
+    # Low-SNR PSF prior (IDL fit_snrlo_psf). For a source with in-segment SNR below
+    # 1.5*fit_snrlo_psf the core is blended in quadrature with a detection-PSF model
+    # carrying total SNR ~ fit_snrlo_psf, so faint templates converge to a PSF.
+    # 0 disables the blend.
+    fit_snrlo_psf: float = 10.0
+    # Wings-SNR cutoff: below this the wings are extended with the PSF model instead
+    # of real data (compact -> PSF wings; extended -> real data).
+    wings_snr_psf: float = 3.0
+    extend_template_ee: float = 0.95  # encircled-energy fraction: PSF-wing reach & max template-size cap
+    # --- deprecated PSF-wing extension flags (broken in-place implementation; do not use) ---
+    extend_template_segmap: bool = False  # DEPRECATED: old in-place extension, kept False
     extend_template_min_size_margin: float = 1.5  # cutout margin for min_size sizing
 
     # Internal options: don't change unless you know what you're doing
@@ -110,6 +129,16 @@ class FitConfig:
     generate_scene_catalog: bool = False  # If True, generate scene catalog and exit
 
     def __post_init__(self):
+        # Validate template extension mode (guards typos like "Auto"/"non").
+        # Legacy mode names (data/psf/hybrid) collapse to the single auto tree.
+        if self.template_extend_mode in {"data", "psf", "hybrid"}:
+            self.template_extend_mode = "auto"
+        valid_modes = {"none", "auto"}
+        if self.template_extend_mode not in valid_modes:
+            raise ValueError(
+                f"template_extend_mode must be one of {sorted(valid_modes)}, "
+                f"got {self.template_extend_mode!r}"
+            )
         # Derive scene_minimum_bright from astrometric polynomial order if not provided
         if self.scene_minimum_bright is None:
             try:

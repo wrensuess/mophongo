@@ -39,14 +39,21 @@ def test_template_extension_methods(tmp_path):
     psf_lo = PSF.from_array(psfs[1])
     kernel = psf_hi.matching_kernel(psf_lo)
 
-    tmpl = Templates()
+    from mophongo.utils import psf_ee_radius_pix
+    r95 = psf_ee_radius_pix(np.asarray(psf_hi.array, dtype=float), 0.95)
+    ms = 2 * int(np.ceil(r95)) + 6
+
+    tmpl = Templates(min_size=ms)
     tmpl.extract_templates(images[0], segmap, list(zip(catalog["x"], catalog["y"])))
     templates_hires = tmpl._templates
-#    templates = tmpl.convolve_templates(kernel, inplace=False)
 
-    templates_psf = tmpl.extend_with_psf_wings(psf_hi.array,
-                                              target_ee=0.95,
-                                              inplace=False)
+    # New extraction-time extension (data mode) for the diagnostic comparison.
+    ext = Templates(min_size=ms)
+    ext.extract_templates(
+        images[0], segmap, list(zip(catalog["x"], catalog["y"])),
+        extend_mode="data", detection_psf=psf_hi.array, max_radius_pix=r95,
+    )
+    templates_psf = ext._templates
 
     fname_moff = tmp_path / "extension_psf.png"
     save_template_diagnostic(

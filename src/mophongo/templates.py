@@ -11,7 +11,7 @@ from photutils.segmentation import SegmentationImage
 from tqdm import tqdm
 from scipy.signal import fftconvolve
 from scipy.interpolate import interp1d
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, find_objects
 from astropy.nddata import block_reduce
 from astropy.wcs.utils import proj_plane_pixel_scales
 
@@ -426,7 +426,7 @@ class Template(Cutout2D):
 
         # flux
         self.flux = 0.0
-        self.flux_f444w: float = 0.0  # within-segmap F444W flux in image units (pre-normalization sum)
+        self.template_norm: float = 0.0  # within-segmap detection flux in image units (pre-normalization sum)
         self.n_pix: int = 0  # segmap pixel count at extraction time
         self.err = 0.0
         self.err_pred = 0.0  # predicted error from weight map and profile
@@ -558,7 +558,7 @@ class Template(Cutout2D):
         new_cut.flag |= Template.FLAG_CONVOLVED  # mark as convolved
 
         # Propagate area + extension provenance unconditionally (not gated on
-        # s > 0, unlike flux_f444w below): FLAG_SUM_ZERO templates must keep
+        # s > 0, unlike template_norm below): FLAG_SUM_ZERO templates must keep
         # their n_pix and extension flags so downstream bookkeeping is intact.
         new_cut.n_pix = self.n_pix
         new_cut.flag |= self.flag & (Template.FLAG_PSF_EXTENDED | Template.FLAG_EXTEND_FAILED)
@@ -571,7 +571,7 @@ class Template(Cutout2D):
         s = float(new_cut.data.sum())
         if s > 0:
             new_cut.data /= s
-            new_cut.flux_f444w = self.flux_f444w
+            new_cut.template_norm = self.template_norm
         else:
             new_cut.flag |= Template.FLAG_SUM_ZERO
 
@@ -704,8 +704,8 @@ class Template(Cutout2D):
         low.data[:ly, :lx] = lo_block
 
         # Carry source metadata to the low-res template, mirroring
-        # convolve_cutout (block_reduce conserves flux, so flux_f444w is valid).
-        low.flux_f444w = self.flux_f444w
+        # convolve_cutout (block_reduce conserves flux, so template_norm is valid).
+        low.template_norm = self.template_norm
         low.n_pix = self.n_pix
         low.flag |= self.flag & (Template.FLAG_PSF_EXTENDED | Template.FLAG_EXTEND_FAILED)
 
@@ -820,29 +820,23 @@ class Templates:
         segmap: np.ndarray,
         positions: Iterable[Tuple[float, float]],
         kernel: np.ndarray | None = None,
-        extension: np.ndarray | PSFRegionMap | None = None,
-        target_ee: float = 0.95,
         min_size: int = 8,
         wcs: WCS | None = None,
+        **extend_kwargs,
     ) -> "Templates":
-        """Build templates from a detection image.
+        """Build templates from a detection image (extract, then convolve).
 
-        If ``extension`` (the detection PSF, or a PSFRegionMap) is given, each
-        segmap-truncated template is extended with PSF wings before convolution
-        (see :meth:`extend_with_psf_wings`). ``min_size`` should be large enough
-        to hold those wings (see :meth:`min_size_from_aperture`).
+        Template extension is configured via :meth:`extract_templates`
+        (``extend_mode``/``detection_psf``/``max_radius_pix``/...); pass those as
+        ``extend_kwargs`` if desired. The Pipeline wires extension automatically.
         """
         obj = cls(min_size=min_size)
         obj.wcs = wcs
 
-        # Step 1: Extract raw cutouts
-        obj.extract_templates(hires_image, segmap, positions, wcs=wcs)
+        # Step 1: Extract cutouts (optionally extended).
+        obj.extract_templates(hires_image, segmap, positions, wcs=wcs, **extend_kwargs)
 
-        # Step 2: Extend truncated templates with PSF wings (before convolution)
-        if extension is not None:
-            obj.extend_with_psf_wings(extension, target_ee=target_ee, inplace=True)
-
-        # Step 3: Convolve with kernel (includes padding)
+        # Step 2: Convolve with kernel (includes padding).
         if kernel is not None:
             obj.convolve_templates(kernel, inplace=True)
 
@@ -1035,19 +1029,291 @@ class Templates:
         """Return the list of templates."""
         return self._templates
 
+    @staticmethod
+    def _disk_kernel(radius: float) -> np.ndarray:
+        """Binary circular kernel of the given radius (for ownership convolution)."""
+        r = max(1, int(np.ceil(float(radius))))
+        yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+        return ((xx ** 2 + yy ** 2) <= float(radius) ** 2).astype(float)
+
+    @staticmethod
+    def _background_sigma(image: np.ndarray, segmap: np.ndarray,
+                          n_clip: float = 3.0, n_iter: int = 3) -> float | None:
+        """Robust sky sigma from un-segmented pixels, sigma-clipped.
+
+        Used as the hybrid-mode noise fallback when no detection weight map is
+        given. ``segmap == 0`` pixels still contain source wings / undetected
+        light, which would bias a plain MAD high; iterative clipping of positive
+        outliers removes them for a cleaner sky estimate.
+        """
+        bg = image[segmap == 0]
+        bg = bg[np.isfinite(bg)]
+        if bg.size < 10:
+            return None
+        med = float(np.median(bg))
+        sig = 1.4826 * float(np.median(np.abs(bg - med)))
+        for _ in range(n_iter):
+            if sig <= 0:
+                break
+            keep = np.abs(bg - med) < n_clip * sig
+            if keep.sum() < 10 or keep.all():
+                break
+            bg = bg[keep]
+            med = float(np.median(bg))
+            sig = 1.4826 * float(np.median(np.abs(bg - med)))
+        return sig if sig > 0 else None
+
+    @staticmethod
+    def _build_ownership(segmap: np.ndarray, radius: float) -> np.ndarray:
+        """Global area-weighted ownership map (IDL ``kseg>knn``, made disjoint).
+
+        For every pixel, the owner is the segment label with the largest local
+        area within ``radius`` (its disk-convolved segment mask) -- i.e. an
+        ``argmax`` of area-within-disk over all labels. Computed once with a
+        single shared ``best``/``owner`` arbiter so the partition is globally
+        consistent and provably disjoint (each pixel has exactly one owner),
+        while still being area-weighted: a large segment wins more inter-source
+        territory than a small one, unlike a pure-distance Voronoi/EDT.
+
+        Returns an int label map (0 = unowned background beyond ``radius`` of any
+        segment). Segment pixels keep their own label.
+        """
+        disk = Templates._disk_kernel(radius)
+        pad = disk.shape[0] // 2
+        ny, nx = segmap.shape
+        best = np.zeros((ny, nx), dtype=np.float32)
+        # Seed: every segment pixel unconditionally owns itself, so a small
+        # segment next to a large one never loses its own pixels to the
+        # neighbour's larger area-in-disk. Only genuine background (label 0)
+        # pixels are contested below -> self-ownership + disjoint by construction.
+        owner = segmap.astype(segmap.dtype, copy=True)
+        slices = find_objects(segmap)  # index i -> label (i+1)
+        for i, sl in enumerate(slices):
+            if sl is None:
+                continue
+            label = i + 1
+            y0, y1 = max(0, sl[0].start - pad), min(ny, sl[0].stop + pad)
+            x0, x1 = max(0, sl[1].start - pad), min(nx, sl[1].stop + pad)
+            sub = segmap[y0:y1, x0:x1]
+            # Area of this label within the disk. Round to integer: fftconvolve of
+            # binary arrays carries ~1e-15 noise that would otherwise break exact
+            # ties non-deterministically.
+            area = np.rint(fftconvolve((sub == label).astype(np.float32), disk, mode="same"))
+            b = best[y0:y1, x0:x1]
+            o = owner[y0:y1, x0:x1]
+            # Contest background pixels only; strict > so the lowest label wins ties.
+            upd = (area > b) & (sub == 0)
+            o[upd] = label
+            b[upd] = area[upd]
+        return owner
+
+    @staticmethod
+    def _region_snr(img_stamp, ivar_stamp, mask, bg_rms) -> tuple[float, float]:
+        """Integrated SNR and 1σ noise of ``img_stamp`` over ``mask``.
+
+        Noise prefers the formal value from the detection inverse-variance map
+        (``sqrt(Σ 1/ivar)`` over covered pixels), falling back to ``bg_rms·sqrt(n)``
+        when no weight map is available. Returns ``(snr, noise)``; the noise is
+        reused as ``e_seg`` for the low-SNR PSF prior amplitude.
+        """
+        n = int(mask.sum())
+        if n == 0:
+            return 0.0, 0.0
+        flux = float(np.nansum(img_stamp[mask]))
+        noise = 0.0
+        if ivar_stamp is not None:
+            ivar = np.asarray(ivar_stamp, dtype=float)[mask]
+            good = ivar > 0
+            if good.any():
+                noise = float(np.sqrt(np.sum(1.0 / ivar[good])))
+        if noise <= 0 and bg_rms and bg_rms > 0:
+            noise = float(bg_rms) * np.sqrt(n)
+        snr = flux / noise if noise > 0 else 0.0
+        return snr, noise
+
+    def _lookup_detection_psf(self, cut, detection_psf, psf_cache: dict) -> np.ndarray | None:
+        """Per-source detection PSF (ndarray, or PSFRegionMap lookup by sky pos)."""
+        if not isinstance(detection_psf, PSFRegionMap):
+            return np.asarray(detection_psf, dtype=float)
+        x, y = cut.position_original
+        if cut.wcs is not None:
+            ra, dec = cut.wcs.wcs_pix2world(x, y, 0)
+        else:
+            ra, dec = x, y
+        psf_src = detection_psf.get_psf(ra, dec)
+        if psf_src is None:
+            return None
+        key = id(psf_src)
+        arr = psf_cache.get(key)
+        if arr is None:
+            arr = np.asarray(psf_src, dtype=float)
+            psf_cache[key] = arr
+        return arr
+
+    def _extended_composite(
+        self, cut, label, segm, hires_image, *, detection_psf,
+        detection_weight, owner_map, max_radius_pix, psf_ee_radius_pix,
+        aperture_radius_pix, fit_snrlo_psf, wings_snr_psf, bg_rms, psf_cache,
+    ) -> np.ndarray:
+        """Build the in-bounds composite for one source via the auto decision tree.
+
+        Two per-source SNRs choose how the composite ``H`` is built
+        (see ``FitConfig.template_extend_mode``):
+
+        - ``snr_seg``   : in-segment SNR. FAINT sources (``snr_seg <
+          1.5*fit_snrlo_psf``) get their core blended IN QUADRATURE with the
+          detection-PSF model so the template converges to a clean PSF.
+        - ``snr_wings`` : SNR of the owned wings out to the measurement aperture.
+          For bright sources this routes the wings to real data (extended,
+          ``snr_wings > wings_snr_psf``) or to scaled PSF wings (compact).
+
+        Returns an array shaped like ``cut.data[cut.slices_cutout]``. Pixels are
+        restricted to the source's area-weighted ``owner_map`` territory, so the
+        per-source footprints are disjoint by construction.
+        """
+        sl = cut.slices_original
+        seg_stamp = segm.data[sl]
+        img_stamp = np.asarray(hires_image[sl], dtype=cut.data.dtype)
+        ivar_stamp = (
+            np.asarray(detection_weight[sl], dtype=float)
+            if detection_weight is not None else None
+        )
+        own = seg_stamp == label
+        owned = owner_map[sl] == label  # this source's area-weighted territory
+
+        # Source centre in the in-bounds (slices_cutout) frame.
+        xs = cut.input_position_cutout[0] - cut.slices_cutout[1].start
+        ys = cut.input_position_cutout[1] - cut.slices_cutout[0].start
+        h, w = own.shape
+        yy, xx = np.mgrid[0:h, 0:w]
+        r2 = (xx - xs) ** 2 + (yy - ys) ** 2
+
+        # Owned background halo (disjoint across sources via owner_map); the
+        # `seg_stamp == 0` guard keeps a foreign segment's pixel out of this
+        # template. Data extension reaches `max_radius_pix`; PSF wings reach the
+        # 95% PSF-EE radius (both hard caps, so templates never grow unbounded).
+        ee_reach = psf_ee_radius_pix if psf_ee_radius_pix is not None else max_radius_pix
+        bg_owned = owned & (seg_stamp == 0)
+        ext_data = own | (bg_owned & (r2 <= float(max_radius_pix) ** 2))
+        ext_psf = own | (bg_owned & (r2 <= float(ee_reach) ** 2))
+
+        # Two SNRs. snr_wings is measured on the owned wings only out to the
+        # measurement aperture (Rphi).
+        # TODO(wings-snr-radius): revisit whether the full owned halo
+        # (max_radius_pix) should be used here instead of the aperture radius.
+        snr_seg, e_seg = self._region_snr(img_stamp, ivar_stamp, own, bg_rms)
+        ap_r = aperture_radius_pix if aperture_radius_pix is not None else max_radius_pix
+        wings_in_ap = bg_owned & (r2 <= float(ap_r) ** 2)
+        snr_wings, _ = self._region_snr(img_stamp, ivar_stamp, wings_in_ap, bg_rms)
+
+        faint = fit_snrlo_psf > 0 and 0.0 < snr_seg < 1.5 * fit_snrlo_psf
+        # Bright & extended: real data over owned pixels. Also the default when no
+        # usable noise estimate is available (e_seg <= 0) so we never lose flux.
+        extended = (not faint) and (e_seg <= 0 or snr_wings > wings_snr_psf)
+
+        if extended:
+            cut.flag |= Template.FLAG_PSF_EXTENDED
+            return img_stamp * ext_data
+
+        # FAINT or BRIGHT+COMPACT: both need the detection-PSF model.
+        psf_src = self._lookup_detection_psf(cut, detection_psf, psf_cache)
+        if psf_src is None or psf_src.sum() <= 0:
+            cut.flag |= Template.FLAG_EXTEND_FAILED
+            return img_stamp * ext_data  # fall back to real-data extension
+        psf_total = float(psf_src.sum())
+        pcy = (psf_src.shape[0] - 1) / 2.0
+        pcx = (psf_src.shape[1] - 1) / 2.0
+        coords = np.array([pcy + (yy - ys), pcx + (xx - xs)])
+        # Unit-sum detection-PSF model sampled on the cutout grid, so the injected
+        # prior carries total SNR ~ fit_snrlo_psf and the wing amplitude is in flux.
+        psf_cut = map_coordinates(psf_src, coords, order=1, mode="constant", cval=0.0) / psf_total
+
+        comp = np.where(own, img_stamp, 0.0).astype(cut.data.dtype)
+        if faint:
+            # IDL :327-328 -- blend the core with the PSF model IN QUADRATURE:
+            # H_core = sqrt(data^2 + (e_seg*fit_snrlo_psf*psf)^2). Bright pixels are
+            # unchanged; faint/negative pixels converge to the (positive) PSF shape.
+            prior = e_seg * fit_snrlo_psf * psf_cut
+            comp[own] = np.sqrt(comp[own] ** 2 + prior[own] ** 2)
+            # Flux-preserving renormalisation: the quadrature blend fixes the core
+            # SHAPE (noise/negative pixels -> PSF) but ADDS flux (sqrt(a^2+b^2) >= a),
+            # so the composite sum -- and hence template_norm -- overestimates the
+            # true F444W flux. Used as a fitting basis this cancels in the unit-sum
+            # apcor ratio, but template_norm also scales the model SUBTRACTED to form
+            # the F444W neighbour residual / tcor denominator, where the inflation
+            # over-subtracts the core. Rescale the blended core so its total equals
+            # the real in-segment data flux, floored at the in-segment noise so
+            # genuine non-detections keep a sensible (~1 sigma) positive amplitude
+            # rather than collapsing to zero/negative. Shape unchanged; only the sum.
+            blended_sum = float(comp[own].sum())
+            target = max(float(img_stamp[own].sum()), float(e_seg))
+            if blended_sum > 0:
+                comp[own] *= target / blended_sum
+            cut.flag |= Template.FLAG_PSF_EXTENDED
+
+        # Scaled PSF wings out to the 95% EE radius (IDL :331), anchored on the
+        # positive in-segment flux so noise dips do not drag the amplitude.
+        f_seg_psf = float(psf_cut[own].sum())
+        if f_seg_psf >= 1e-8:
+            anchor = float(np.maximum(comp[own], 0.0).sum())
+            wings = ext_psf & (~own)
+            comp = comp + (anchor / f_seg_psf) * psf_cut * wings
+            cut.flag |= Template.FLAG_PSF_EXTENDED
+        else:
+            cut.flag |= Template.FLAG_EXTEND_FAILED
+        return comp
+
     def extract_templates(
         self,
         hires_image: np.ndarray,
         segmap: np.ndarray,
         positions: Iterable[Tuple[float, float]],
         wcs: WCS | None = None,
+        *,
+        extend_mode: str = "none",
+        detection_psf: "np.ndarray | PSFRegionMap | None" = None,
+        detection_weight: np.ndarray | None = None,
+        max_radius_pix: float = 0.0,
+        psf_ee_radius_pix: float | None = None,
+        aperture_radius_pix: float | None = None,
+        fit_snrlo_psf: float = 0.0,
+        wings_snr_psf: float = 3.0,
     ) -> list[Template]:
-        """Extract cutout templates around segmentation regions."""
+        """Extract cutout templates around segmentation regions.
+
+        When ``extend_mode`` is not ``"none"`` the composite is built beyond the
+        segment with real-data and/or PSF wings (restricted to the global
+        area-weighted ownership footprint within ``max_radius_pix``) before the
+        unit-sum normalisation, so ``template_norm`` captures the extended
+        composite (the invariant ``template_norm * H == composite`` then holds
+        for the extended shape).
+        """
 
         self.original_shape = hires_image.shape
         segm = SegmentationImage(segmap)
         templates: list[Template] = []
         ny, nx = hires_image.shape
+
+        extend = extend_mode != "none"
+        bg_rms = None
+        owner_map = None
+        psf_cache: dict = {}
+        if extend:
+            # Global area-weighted ownership, computed once. The contest disk
+            # radius is the fill cap (max_radius_pix) so the halo can reach the
+            # measurement aperture for isolated sources.
+            # TODO(ownership-radius): the plan/IDL used a localized rhalf_det (R50)
+            # contest disk. We use the (larger) fill radius so isolated compact
+            # sources fill out to the aperture; the trade-off is that a big source
+            # wins inter-source territory out to max_radius. A future refinement
+            # could decouple these (assign reach by nearest-owner out to the cap,
+            # but run the area-weighted boundary contest at ~R50 in overlap zones).
+            owner_map = self._build_ownership(segmap, max_radius_pix)
+            # The auto tree always needs a per-source noise estimate (snr_seg /
+            # snr_wings). Prefer the formal noise from the detection weight
+            # (inverse-variance) map; fall back to a clipped sky sigma when absent.
+            if detection_weight is None:
+                bg_rms = self._background_sigma(hires_image, segmap)
 
         for pos in tqdm(positions, desc="Extracting templates"):
             # silently skip invalid positions
@@ -1072,16 +1338,42 @@ class Templates:
             # Create template cutout
             cut = Template(hires_image, pos, (height, width), wcs=wcs, label=label)
 
-            # zero out all non segment pixels
+            # segmap pixel count at extraction (independent of extension)
             seg_mask = segm.data[cut.slices_original] == label
-            cut.data[cut.slices_cutout] *= seg_mask.astype(cut.data.dtype)
-            cut.n_pix = int(seg_mask.sum())  # segmap pixel count at extraction
+            cut.n_pix = int(seg_mask.sum())
+
+            if extend and cut.n_pix > 0:
+                # Build the extended composite within the ownership footprint.
+                comp = self._extended_composite(
+                    cut, label, segm, hires_image,
+                    detection_psf=detection_psf,
+                    detection_weight=detection_weight,
+                    owner_map=owner_map, max_radius_pix=max_radius_pix,
+                    psf_ee_radius_pix=psf_ee_radius_pix,
+                    aperture_radius_pix=aperture_radius_pix,
+                    fit_snrlo_psf=fit_snrlo_psf, wings_snr_psf=wings_snr_psf,
+                    bg_rms=bg_rms, psf_cache=psf_cache,
+                )
+                cut.data[cut.slices_cutout] = comp.astype(cut.data.dtype)
+            else:
+                # zero out all non segment pixels
+                cut.data[cut.slices_cutout] *= seg_mask.astype(cut.data.dtype)
+
+            # Enforce positivity on EVERY template (all paths): a source profile
+            # must be non-negative -- negative pixels corrupt the unit-sum
+            # normalisation, the wing-flux anchor and the apF/apB ratio.
+            # TODO(positivity): clipping to zero is a placeholder; a negative pixel
+            # should ideally be replaced by the scaled PSF model value at that
+            # pixel (smoother, matches IDL's <=0 -> PSF-fill). Zero is OK for now.
+            np.clip(cut.data, 0.0, None, out=cut.data)
 
             # sum data should never be zero. There should
             # there should also never be NaNs.
-            # Normalize the template so its sum is 1 (if nonzero)
+            # Normalize the template so its sum is 1 (if nonzero). template_norm
+            # is captured AFTER the composite is built (so it includes the wings)
+            # and BEFORE normalising, preserving template_norm * H == composite.
             total = cut.data.sum()
-            cut.flux_f444w = float(total)
+            cut.template_norm = float(total)
             if total != 0:
                 cut.data /= total
             else:
@@ -1148,151 +1440,6 @@ class Templates:
                 new_templates.append(new_tmpl)
 
         return new_templates if not inplace else self._templates
-
-    def extend_with_psf_wings(
-        self,
-        psf: np.ndarray | PSFRegionMap,
-        *,
-        target_ee: float = 0.95,
-        inplace: bool = True,
-    ) -> List[Template]:
-        """Extend segmap-truncated templates with scaled PSF wings.
-
-        A template whose segmap captures only a small fraction of the PSF (small
-        ``n_pix``) is a poor shape model because it is missing the PSF wings. For
-        every template with ``0 < n_pix < ee_area`` -- where ``ee_area`` is the
-        ``target_ee`` encircled-energy area of the detection PSF -- the PSF,
-        scaled to the in-segment flux, is pasted into the pixels outside the
-        segment (within the ``target_ee`` radius), making the template a faithful
-        PSF shape. Templates with an adequate segmap (``n_pix >= ee_area``) and
-        empty templates (``n_pix == 0``) are left untouched.
-
-        Flux bookkeeping. ``flux_f444w`` (the within-segmap detection flux that the
-        Mode-B aperture-correction loop reads off the original template) is updated
-        to the inferred total ``flux_f444w / f_seg``, where ``f_seg`` is the
-        fraction of the PSF flux that falls in the segment. This is derived from
-        the full (uncropped) PSF, so the EE-crop applied to the pasted pixels --
-        which only bounds the added array footprint -- does not bias the
-        denominator low. The matching/convolution PSF elsewhere is not cropped by
-        this routine.
-
-        Parameters
-        ----------
-        psf : np.ndarray or PSFRegionMap
-            Detection-band PSF (e.g. F444W). For a PSFRegionMap the per-source PSF
-            is looked up by sky position, mirroring :meth:`convolve_templates`; the
-            size threshold uses the map's first (representative) PSF.
-        target_ee : float
-            Encircled-energy fraction setting the size threshold and the radius to
-            which the pasted PSF is cropped.
-        inplace : bool
-            If True (default) modify and return the stored templates, avoiding a
-            peak-memory copy. Otherwise operate on deep copies.
-
-        Returns
-        -------
-        list of Template
-        """
-        is_map = isinstance(psf, PSFRegionMap)
-        rep_psf = np.asarray(psf.psfs[0] if is_map else psf, dtype=float)
-        # Representative EE radius/area for the size threshold. For a single
-        # ndarray PSF this is also the per-source radius, so it is reused below
-        # to avoid recomputing the curve of growth for every template.
-        rep_ee_r = psf_ee_radius_pix(rep_psf, target_ee)
-        ee_area = int(np.ceil(np.pi * rep_ee_r**2))
-        ee_r_cache: dict[int, float] = {}  # per-region EE radius (map path)
-
-        templates = self._templates if inplace else [deepcopy(t) for t in self._templates]
-        for tmpl in tqdm(templates, desc="Extending with PSF wings"):
-            # Idempotency: never re-process an already-handled template -- on a
-            # second pass (or post-convolution) ``data > 0`` would include the
-            # pasted wings and re-inflate flux_f444w.
-            if tmpl.flag & (Template.FLAG_PSF_EXTENDED | Template.FLAG_EXTEND_FAILED):
-                continue
-            if not (0 < tmpl.n_pix < ee_area):
-                continue
-
-            # Per-source detection PSF (mirror convolve_templates for a map)
-            if is_map:
-                x, y = tmpl.position_original
-                if tmpl.wcs is not None:
-                    ra, dec = tmpl.wcs.wcs_pix2world(x, y, 0)
-                else:
-                    ra, dec = x, y
-                psf_src = psf.get_psf(ra, dec)
-                region_key = id(psf_src)  # get_psf returns a stable per-region array
-            else:
-                psf_src = rep_psf
-                region_key = None
-            if psf_src is None:
-                tmpl.flag |= Template.FLAG_EXTEND_FAILED
-                continue
-            psf_src = np.asarray(psf_src, dtype=float)
-            psf_total = float(psf_src.sum())
-            if psf_total <= 0:
-                tmpl.flag |= Template.FLAG_EXTEND_FAILED
-                continue
-
-            data = tmpl.data
-            ny, nx = data.shape
-            xs, ys = tmpl.input_position_cutout  # float source position (x, y)
-
-            # The target-EE disk must fit inside the cutout. Otherwise the pasted
-            # wings clip at the edge while flux_f444w is raised to the full total,
-            # silently recreating the truncated-template bias this routine fixes.
-            # Fail rather than corrupt; correct usage sizes the cutout via
-            # min_size_from_aperture / 2 * psf_ee_radius_pix.
-            if not is_map:
-                ee_r = rep_ee_r
-            else:
-                ee_r = ee_r_cache.get(region_key)
-                if ee_r is None:
-                    ee_r = psf_ee_radius_pix(psf_src, target_ee)
-                    ee_r_cache[region_key] = ee_r
-            if ee_r > min(xs, nx - 1 - xs, ys, ny - 1 - ys):
-                tmpl.flag |= Template.FLAG_EXTEND_FAILED
-                continue
-
-            # Bilinear-sample the PSF onto the cutout grid at the sub-pixel
-            # source position; normalise so it sums to the PSF flux fraction.
-            yy, xx = np.mgrid[0:ny, 0:nx]
-            pcy = (psf_src.shape[0] - 1) / 2.0
-            pcx = (psf_src.shape[1] - 1) / 2.0
-            coords = np.array([pcy + (yy - ys), pcx + (xx - xs)])
-            psf_cut = map_coordinates(psf_src, coords, order=1, mode="constant", cval=0.0)
-            psf_cut /= psf_total
-
-            # Segment footprint captured before pasting.
-            seg = data > 0
-            f_seg = float(psf_cut[seg].sum())  # PSF fraction in the segment
-            if f_seg < 1e-8:  # negligible overlap -> cannot scale reliably
-                tmpl.flag |= Template.FLAG_EXTEND_FAILED
-                continue
-
-            # Scale so the PSF's in-segment sum matches the template's, then paste
-            # the wings outside the segment within the target-EE radius, in place.
-            s = float(data[seg].sum()) / f_seg
-            within = (xx - xs) ** 2 + (yy - ys) ** 2 <= ee_r**2
-            paste = (~seg) & within
-            data[paste] += s * psf_cut[paste]
-
-            # Re-normalise to unit sum so the template keeps the convention the
-            # aperture code relies on -- aper(T, r) is a *fraction* of a unit-sum
-            # template (see _aperture_sum_on_template). The raised flux_f444w
-            # below carries the absolute scale. Without this, the Mode-A ap_F_frac,
-            # read off the un-convolved original, would be inflated by the pasted
-            # wing flux. (Mode-B reads ap_B_frac off the convolved template, which
-            # convolve_cutout already re-normalises, so it is unaffected either way.)
-            total = float(data.sum())
-            if total > 0:
-                data /= total
-
-            # Raise flux_f444w to the inferred total (uncropped PSF). Updated on
-            # this template object, which is the original when inplace=True.
-            tmpl.flux_f444w = tmpl.flux_f444w / f_seg
-            tmpl.flag |= Template.FLAG_PSF_EXTENDED
-
-        return templates
 
 
 # ---------------------------------------------------- obsolete methods -------------------

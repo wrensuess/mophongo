@@ -153,11 +153,13 @@ def _pipeline_inputs():
     return images, segmap, catalog, psfs, wcs, weights
 
 
-def test_pipeline_run_extends_when_enabled():
-    """Step 8: extension is wired into Pipeline.run and sizes the cutouts."""
+def test_pipeline_run_sizes_cutouts_when_mode_set():
+    """Phase 0: selecting an extension mode caches the detection-PSF growth
+    curve and enlarges min_size to hold the EE-cap disk + aperture (the actual
+    wing fill is wired in Phase 2)."""
     images, segmap, catalog, psfs, wcs, weights = _pipeline_inputs()
     cfg = FitConfig(
-        extend_template_segmap=True,
+        template_extend_mode="psf",
         aperture_diam=0.3,
         aperture_units="arcsec",
         fit_astrometry_niter=0,
@@ -169,25 +171,24 @@ def test_pipeline_run_extends_when_enabled():
     )
     cat, _resid = pl.run()
     assert len(cat) > 0
-    # The PSF floor bumped min_size above the default 8.
+    # The PSF/aperture floor bumped min_size above the default 8.
     assert pl.tmpls.min_size > 8
+    # Growth curve cached with the standard EE fractions.
+    assert pl.detection_psf is not None
+    assert set(pl.ee_radii_pix) >= {0.5, 0.95, 0.99}
+    assert pl.ee_radii_pix[0.5] < pl.ee_radii_pix[0.95] < pl.ee_radii_pix[0.99]
+    # Templates remain unit-sum (the apcor invariant the Estimator-3 code needs).
     for t in pl.tmpls._templates:
-        # Every flagged template is consistent (extended xor failed, never both).
-        assert not (
-            (t.flag & Template.FLAG_PSF_EXTENDED)
-            and (t.flag & Template.FLAG_EXTEND_FAILED)
-        )
-        # Invariant the apcor code relies on: hires templates stay unit-sum even
-        # after wing extension (the raised flux_f444w carries the scale).
         if t.data.sum() != 0:
             assert t.data.sum() == pytest.approx(1.0, rel=1e-6)
 
 
-def test_pipeline_run_no_extension_when_disabled():
-    """With the switch off, nothing is extended and min_size stays default."""
+def test_pipeline_run_no_extension_when_mode_none():
+    """With template_extend_mode='none' (default), min_size stays default and
+    nothing is extended."""
     images, segmap, catalog, psfs, wcs, weights = _pipeline_inputs()
     cfg = FitConfig(
-        extend_template_segmap=False,
+        template_extend_mode="none",
         fit_astrometry_niter=0,
         run_scene_solver=False,
     )
@@ -200,190 +201,158 @@ def test_pipeline_run_no_extension_when_disabled():
     assert not any(t.flag & Template.FLAG_PSF_EXTENDED for t in pl.tmpls._templates)
 
 
-# --- Step 5: PSF-wing extension ---------------------------------------------
+# --- Extraction-time template extension (data / psf / hybrid) ----------------
 
 
 def _point_source_scene(total_flux=1000.0, sigma=3.0, n=121, seg_frac=0.5):
-    """Image of a single Gaussian point source and a core-only segmap.
-
-    The segmap thresholds the PSF at ``seg_frac`` of the peak, so it captures
-    only the bright core (small n_pix), reproducing the truncated-template
-    failure mode.
-    """
-    psf = _gaussian_psf(n=n, sigma=sigma)  # sums to 1
+    """Gaussian point source with a core-only segmap (truncated-template case)."""
+    psf = _gaussian_psf(n=n, sigma=sigma)
     image = total_flux * psf
-    segmap = (image > seg_frac * image.max()).astype(int)  # label 1 core
+    segmap = (image > seg_frac * image.max()).astype(int)
     pos = ((n - 1) / 2.0, (n - 1) / 2.0)
     return image, segmap, psf, pos
 
 
-def test_extension_raises_flux_f444w_to_inferred_total():
-    """flux_f444w should relax to ~the true total after extension (Blocker B2)."""
-    total_flux = 1000.0
-    image, segmap, psf, pos = _point_source_scene(total_flux=total_flux, sigma=3.0)
-
-    tmpls = Templates(min_size=40)  # room for the wings
-    tmpls.extract_templates(image, segmap, [pos])
-    t = tmpls._templates[0]
-    seg_flux = t.flux_f444w
-    assert seg_flux < 0.8 * total_flux  # truncated: segmap holds only the core
-
-    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
-    assert t.flag & Template.FLAG_PSF_EXTENDED
-    # inferred total ~ the true source flux
-    assert t.flux_f444w == pytest.approx(total_flux, rel=0.05)
-    # flux was actually pasted outside the original segment
-    assert (t.data[~(t.data == 0)]).size > 0
-    # Invariant: the template stays unit-sum (aperture code reads aper(T) as a
-    # *fraction*); the raised flux_f444w carries the absolute scale.
-    assert t.data.sum() == pytest.approx(1.0, rel=1e-6)
+def _footprint(tm, shape):
+    fp = np.zeros(shape, bool)
+    fp[tm.slices_original] = tm.data[tm.slices_cutout] != 0
+    return fp
 
 
-def test_extension_makes_template_psf_shaped():
-    """After extension the (unit-summed) core matches a clean PSF cutout."""
-    image, segmap, psf, pos = _point_source_scene(sigma=3.0, n=121)
-    tmpls = Templates(min_size=40)
-    tmpls.extract_templates(image, segmap, [pos])
-    t = tmpls._templates[0]
-
-    before_outside = float(t.data[t.data == 0].size)
-    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
-    # fewer zero pixels: wings now fill part of the previously-empty region
-    after_zeros = float((t.data == 0).sum())
-    assert after_zeros < before_outside
-
-
-def test_extension_skips_adequate_segmap():
-    """A source whose segmap already exceeds ee_area is left untouched."""
-    # Low threshold -> segmap captures most of the PSF (large n_pix >= ee_area)
-    image, segmap, psf, pos = _point_source_scene(sigma=3.0, n=121, seg_frac=0.001)
-    tmpls = Templates(min_size=40)
-    tmpls.extract_templates(image, segmap, [pos])
-    t = tmpls._templates[0]
-    ee_area = psf_ee_area_pix(psf, 0.95)
-    assert t.n_pix >= ee_area
-
-    before = t.data.copy()
-    flux_before = t.flux_f444w
-    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
-    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
-    assert t.flux_f444w == flux_before
-    np.testing.assert_array_equal(t.data, before)
-
-
-def test_extension_skips_empty_template():
-    """n_pix == 0 (e.g. FLAG_SUM_ZERO) is never extended."""
-    t = Template(np.zeros((40, 40)), (20, 20), (40, 40), label=1)
-    t.n_pix = 0
-    tmpls = Templates()
-    tmpls._templates = [t]
-    tmpls.extend_with_psf_wings(_gaussian_psf(sigma=3.0), inplace=True)
-    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
-
-
-def test_extension_zero_overlap_guard_sets_failed_flag():
-    """If the PSF has negligible overlap with the segment, flag and skip."""
-    n = 41
-    data = np.zeros((n, n))
-    data[0:3, 0:3] = 1.0  # segment in the corner
-
-    # Source position at the centre, far from the corner segment; a narrow PSF
-    # sampled at the centre is ~0 over the corner -> f_seg ~ 0.
-    t = Template(data, (20, 20), (n, n), label=1)
-    t.n_pix = 9
-    tmpls = Templates()
-    tmpls._templates = [t]
-
-    narrow_psf = _gaussian_psf(n=41, sigma=1.0)
-    ee_area = psf_ee_area_pix(narrow_psf, 0.95)
-    assert 0 < t.n_pix < ee_area  # passes the size gate, so the guard is exercised
-
-    tmpls.extend_with_psf_wings(narrow_psf, target_ee=0.95, inplace=True)
-    assert t.flag & Template.FLAG_EXTEND_FAILED
-    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
-
-
-def test_extension_is_idempotent():
-    """A second call must not re-inflate flux_f444w (guarded by the flag)."""
-    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0)
-    tmpls = Templates(min_size=40)
-    tmpls.extract_templates(image, segmap, [pos])
-    t = tmpls._templates[0]
-
-    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
-    flux_once = t.flux_f444w
-    data_once = t.data.copy()
-    assert t.flag & Template.FLAG_PSF_EXTENDED
-
-    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
-    assert t.flux_f444w == flux_once
-    np.testing.assert_array_equal(t.data, data_once)
-
-
-def test_extension_fails_when_cutout_too_small_for_wings():
-    """If the EE disk does not fit in the cutout, fail instead of clipping."""
-    # Default min_size=8 -> ~8px cutout, far smaller than the sigma=3 EE radius.
-    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0)
-    tmpls = Templates()  # min_size=8
-    tmpls.extract_templates(image, segmap, [pos])
-    t = tmpls._templates[0]
-    ee_area = psf_ee_area_pix(psf, 0.95)
-    assert 0 < t.n_pix < ee_area  # passes the size gate
-    flux_before = t.flux_f444w
-
-    tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=True)
-    assert t.flag & Template.FLAG_EXTEND_FAILED
-    assert not (t.flag & Template.FLAG_PSF_EXTENDED)
-    assert t.flux_f444w == flux_before  # denominator untouched on failure
-
-
-def test_extension_with_psfregionmap():
-    """Detection PSF may be a PSFRegionMap (production passes one, not an ndarray)."""
-    import geopandas as gpd
-    from shapely.geometry import box
-    from mophongo.psf_map import PSFRegionMap
-
+def test_data_mode_extends_beyond_segment_and_is_unit_sum():
+    """data mode fills real pixels beyond the segment; template stays unit-sum and
+    template_norm captures the extended composite (invariant template_norm*H=composite)."""
     image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0, n=121)
-    regions = gpd.GeoDataFrame(
-        {"psf_key": [0], "geometry": [box(149, 1, 151, 3)]}, crs="EPSG:4326"
-    )
-    prm = PSFRegionMap(regions=regions, psfs=np.array([psf]))
+    trunc = Templates(min_size=61)
+    trunc.extract_templates(image, segmap, [pos])
+    n_trunc = int((trunc._templates[0].data != 0).sum())
 
-    tmpls = Templates(min_size=40)
-    tmpls.extract_templates(image, segmap, [pos], wcs=_simple_wcs(pscale_arcsec=0.1, n=121))
-    tmpls.extend_with_psf_wings(prm, target_ee=0.95, inplace=True)
-    t = tmpls._templates[0]
+    ext = Templates(min_size=61)
+    ext.extract_templates(image, segmap, [pos], extend_mode="data",
+                          detection_psf=psf, max_radius_pix=20.0)
+    t = ext._templates[0]
+    assert int((t.data != 0).sum()) > n_trunc          # genuinely extended
     assert t.flag & Template.FLAG_PSF_EXTENDED
-    assert t.flux_f444w == pytest.approx(1000.0, rel=0.05)
+    assert t.data.sum() == pytest.approx(1.0, rel=1e-6)  # unit-sum invariant
+    # template_norm should exceed the segmap-only flux (now holds the wings)
+    assert t.template_norm > trunc._templates[0].template_norm
+
+
+def test_psf_mode_wings_follow_the_psf():
+    """psf mode: the (unit-sum) extended template is proportional to the PSF."""
+    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0, n=121)
+    ext = Templates(min_size=61)
+    ext.extract_templates(image, segmap, [pos], extend_mode="psf",
+                          detection_psf=psf, max_radius_pix=20.0)
+    t = ext._templates[0]
+    assert t.flag & Template.FLAG_PSF_EXTENDED
     assert t.data.sum() == pytest.approx(1.0, rel=1e-6)
+    # On a noiseless point source the composite must track the PSF: high
+    # correlation between the filled template and the PSF over its footprint.
+    fp = t.data[t.slices_cutout] != 0
+    psf_cut = psf[t.slices_original]
+    a = t.data[t.slices_cutout][fp].ravel()
+    b = psf_cut[fp].ravel()
+    assert np.corrcoef(a, b)[0, 1] > 0.99
 
 
-def test_from_image_wires_extension():
-    """Step 6: from_image(extension=psf, ...) extends truncated templates."""
-    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0)
-    tmpls = Templates.from_image(
-        image, segmap, [pos], extension=psf, target_ee=0.95, min_size=40
-    )
-    t = tmpls._templates[0]
-    assert t.flag & Template.FLAG_PSF_EXTENDED
-    assert t.flux_f444w == pytest.approx(1000.0, rel=0.05)
-    # Without extension the dead parameter path stays a no-op
-    plain = Templates.from_image(image, segmap, [pos], min_size=40)
+def test_ownership_is_self_consistent_tiny_next_to_big():
+    """A 1-px segment keeps its own pixel even beside a much larger segment."""
+    seg = np.zeros((60, 60), int)
+    seg[20:40, 20:40] = 2          # big segment
+    seg[30, 19] = 1                # 1-px segment adjacent
+    owner = Templates._build_ownership(seg, radius=8.0)
+    assert owner[30, 19] == 1      # self-ownership preserved
+    assert owner[25, 25] == 2
+
+
+def test_extended_neighbours_are_disjoint():
+    """Two close sources' extended templates never share a pixel (data mode)."""
+    n = 81
+    yy, xx = np.mgrid[0:n, 0:n]
+    def g(cx, cy, s, a): return a * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * s ** 2))
+    img = g(30, 40, 5.0, 200.0) + g(50, 40, 2.0, 60.0)
+    seg = np.zeros((n, n), int)
+    seg[(g(30, 40, 5.0, 200.0) > 60) & (xx < 41)] = 1
+    seg[(g(50, 40, 2.0, 60.0) > 18) & (xx >= 41)] = 2
+    psf = g(40, 40, 3.0, 1.0); psf /= psf.sum()
+    t = Templates(min_size=41)
+    tmpls = t.extract_templates(img, seg, [(30, 40), (50, 40)], extend_mode="data",
+                               detection_psf=psf, max_radius_pix=12.0)
+    foot = np.zeros((n, n), int)
+    for tm in tmpls:
+        fp = _footprint(tm, (n, n))
+        assert int((foot & fp).sum()) == 0   # disjoint
+        foot |= fp
+
+
+def test_fill_reaches_max_radius():
+    """For an isolated source the fill extends out to ~max_radius_pix."""
+    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=2.0, n=121)
+    R = 18.0
+    ext = Templates(min_size=2 * int(np.ceil(R)) + 4)
+    ext.extract_templates(image, segmap, [pos], extend_mode="data",
+                          detection_psf=psf, max_radius_pix=R)
+    t = ext._templates[0]
+    fp = t.data[t.slices_cutout] != 0
+    ys, xs = np.where(fp)
+    cx = t.input_position_cutout[0] - t.slices_cutout[1].start
+    cy = t.input_position_cutout[1] - t.slices_cutout[0].start
+    rmax = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2).max()
+    assert rmax >= R - 1.5   # reaches the requested radius (isolated -> no owner cut)
+
+
+def test_auto_routes_by_wing_signal():
+    """auto tree: a real extended halo -> data wings; a noise-only halo -> psf wings.
+
+    The branch is forced for the reference via ``wings_snr_psf`` (negative => any
+    wing SNR counts as extended -> data; huge => no wing SNR qualifies -> psf), and
+    the auto choice (``wings_snr_psf=3``) must match the corresponding reference.
+    """
+    n = 121
+    yy, xx = np.mgrid[0:n, 0:n]
+    def g(cx, cy, s, a): return a * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * s ** 2))
+    psf = g(60, 60, 2.0, 1.0); psf /= psf.sum()
+    core = g(60, 60, 2.0, 400.0)
+    seg = np.zeros((n, n), int); seg[core > 0.5 * core.max()] = 1
+    pos = (60.0, 60.0)
+    ivar = np.full((n, n), 1.0)  # sigma = 1
+    kw = dict(extend_mode="auto", detection_psf=psf, detection_weight=ivar, max_radius_pix=22.0)
+
+    # Real broad halo present -> high wing SNR -> data extension.
+    rng = np.random.default_rng(0)
+    img_halo = core + g(60, 60, 9.0, 40.0) + rng.normal(0, 1.0, (n, n))
+    th = Templates(min_size=61)
+    th.extract_templates(img_halo, seg, [pos], wings_snr_psf=3.0, **kw)
+    td = Templates(min_size=61)  # force data branch
+    td.extract_templates(img_halo, seg, [pos], wings_snr_psf=-1.0, **kw)
+    assert np.allclose(th._templates[0].data, td._templates[0].data)  # chose data
+
+    # No real halo: beyond the segment is pure noise -> low wing SNR -> psf wings.
+    img_noise = core * (seg == 1) + rng.normal(0, 1.0, (n, n))
+    th2 = Templates(min_size=61)
+    th2.extract_templates(img_noise, seg, [pos], wings_snr_psf=3.0, **kw)
+    tp = Templates(min_size=61)  # force psf branch
+    tp.extract_templates(img_noise, seg, [pos], wings_snr_psf=1e9, **kw)
+    assert np.allclose(th2._templates[0].data, tp._templates[0].data)  # chose psf
+
+
+def test_extend_none_leaves_truncated_templates():
+    image, segmap, psf, pos = _point_source_scene(sigma=3.0, n=121)
+    a = Templates(min_size=61)
+    a.extract_templates(image, segmap, [pos], extend_mode="none")
+    b = Templates(min_size=61)
+    b.extract_templates(image, segmap, [pos])  # default extend handled by Pipeline, not here
+    np.testing.assert_array_equal(a._templates[0].data, b._templates[0].data)
+    assert not (a._templates[0].flag & Template.FLAG_PSF_EXTENDED)
+
+
+def test_from_image_passes_extend_kwargs():
+    image, segmap, psf, pos = _point_source_scene(total_flux=1000.0, sigma=3.0, n=121)
+    tmpls = Templates.from_image(image, segmap, [pos], min_size=61,
+                                 extend_mode="data", detection_psf=psf, max_radius_pix=20.0)
+    assert tmpls._templates[0].flag & Template.FLAG_PSF_EXTENDED
+    plain = Templates.from_image(image, segmap, [pos], min_size=61)
     assert not (plain._templates[0].flag & Template.FLAG_PSF_EXTENDED)
 
 
-def test_extension_inplace_false_preserves_originals():
-    image, segmap, psf, pos = _point_source_scene(sigma=3.0, n=121)
-    tmpls = Templates(min_size=40)
-    tmpls.extract_templates(image, segmap, [pos])
-    orig = tmpls._templates[0]
-    orig_flux = orig.flux_f444w
-    orig_data = orig.data.copy()
-
-    out = tmpls.extend_with_psf_wings(psf, target_ee=0.95, inplace=False)
-    assert out[0] is not orig
-    # originals untouched
-    assert orig.flux_f444w == orig_flux
-    np.testing.assert_array_equal(orig.data, orig_data)
-    # the returned copy was extended
-    assert out[0].flag & Template.FLAG_PSF_EXTENDED

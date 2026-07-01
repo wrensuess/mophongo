@@ -18,6 +18,7 @@ from collections import defaultdict
 from tqdm import tqdm
 
 from astropy.table import Table
+from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.nddata import Cutout2D, block_replicate, block_reduce
 from photutils.aperture import CircularAperture, aperture_photometry
@@ -456,6 +457,51 @@ class Pipeline:
         phot = aperture_photometry(tmpl.data[tmpl.slices_cutout], aper, method="exact")
         return float(phot["aperture_sum"][0])
 
+    def _aperture_sum_on_map(self, fullmap: np.ndarray, tmpl: Template, radius_pix: float) -> float:
+        """Exact circular aperture sum of a FULL-image map at a source's position.
+
+        Same geometry as :meth:`_aperture_sum_on_template`, but the values come
+        from ``fullmap[tmpl.slices_original]`` (e.g. the F444W residual) instead
+        of the template's own data. Aperture-sum linearity then gives, for the
+        neighbour-subtracted F444W flux of this source,
+        ``aper(residual + model_i) = aper(residual) + template_norm * ap_F_frac``.
+        """
+        xc = tmpl.input_position_cutout[0] - tmpl.slices_cutout[1].start
+        yc = tmpl.input_position_cutout[1] - tmpl.slices_cutout[0].start
+        aper = CircularAperture((float(xc), float(yc)), r=float(radius_pix))
+        phot = aperture_photometry(fullmap[tmpl.slices_original], aper, method="exact")
+        return float(phot["aperture_sum"][0])
+
+    def _build_f444w_residual(self, orig_templates: list[Template]) -> np.ndarray:
+        """F444W neighbour-subtracted residual map: images[0] - Σ_j model_j.
+
+        Each high-res template (unit-sum) is scaled by ``template_norm`` (its
+        detection-band flux) and subtracted from the F444W image. Built once and
+        reused across bands; for each source we add its own model back before the
+        aperture sum, so the tcor_H denominator is the real neighbour-subtracted
+        F444W aperture flux rather than the (noise-level) template sum. The map is
+        written to disk for over-subtraction diagnosis.
+        """
+        # Native dtype copy (typically float32) — avoids doubling memory on the
+        # full mosaic. Each pixel is covered by only a few templates, so float32
+        # accumulation is fine for this diagnostic/aperture-sum use.
+        res = np.array(self.images[0], copy=True)
+        for t in orig_templates:
+            tn = float(getattr(t, "template_norm", 0.0) or 0.0)
+            if tn and np.isfinite(tn):
+                res[t.slices_original] -= t.data[t.slices_cutout] * tn
+        try:
+            hdr = (
+                self.wcs[0].to_header()
+                if self.wcs is not None and self.wcs[0] is not None
+                else None
+            )
+            fits.writeto("f444w_template_residual.fits", res.astype(np.float32), hdr, overwrite=True)
+            logger.info("Wrote F444W template residual map -> f444w_template_residual.fits")
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.warning("Could not save F444W template residual map: %s", exc)
+        return res
+
     def _residual_segmap_sum(
         self,
         residual: np.ndarray,
@@ -508,6 +554,34 @@ class Pipeline:
 
         return float((residual[sl_lo] * mask_lo).sum())
 
+    def _other_source_mask(self, tmpl: Template, source_id: int, k: int) -> np.ndarray | None:
+        """Boolean mask (shape of residual[tmpl.slices_original]) of pixels that
+        belong to OTHER sources' segments.
+
+        Used to exclude neighbour-segment pixels from a source's residual aperture
+        (a partial mitigation of the blend residual double-count -- see the TODO
+        in ``_add_aperture_photometry``). Returns None if shapes don't line up.
+        """
+        sl = tmpl.slices_original
+        h = sl[0].stop - sl[0].start
+        w = sl[1].stop - sl[1].start
+        seg = self.segmap
+        if k == 1:
+            sub = seg[sl]
+            if sub.shape != (h, w):
+                return None
+            return (sub != 0) & (sub != source_id)
+        # Multi-resolution: map the low-res patch to the high-res segmap block,
+        # mark "other source" at high-res, then OR-reduce to low-res.
+        y0, x0 = sl[0].start * k, sl[1].start * k
+        hi = np.zeros((h * k, w * k), dtype=seg.dtype)
+        ys1 = min(y0 + h * k, seg.shape[0])
+        xs1 = min(x0 + w * k, seg.shape[1])
+        hi[: ys1 - y0, : xs1 - x0] = seg[y0:ys1, x0:xs1]
+        other_hi = (hi != 0) & (hi != source_id)
+        other_lo = block_reduce(other_hi.astype(np.uint8), k, func=np.sum) > 0
+        return other_lo if other_lo.shape == (h, w) else None
+
     @staticmethod
     def _intersect_slices(tmpl: Template, y0: int, y1: int, x0: int, x1: int):
         """Compute the intersection of a template's valid region with a bounding box.
@@ -551,27 +625,37 @@ class Pipeline:
     ) -> None:
         """Compute per-source aperture corrections (Estimator 3).
 
-        Templates are unit-sum normalised; orig_t.flux_f444w holds the
-        pre-normalisation F444W total, converting aperture fractions to real
-        flux units.
+        Templates are unit-sum normalised; ``orig_t.template_norm`` holds the
+        pre-normalisation detection-band sum, converting aperture fractions to
+        real flux units. All quantities below in real (image) flux units:
 
-        ap_B_real = flux_f444w * aper(H*K, r_img)   — MIRI aperture in real units
-        ap_F_real = flux_f444w * aper(H,   r_orig)  — F444W aperture in real units
+        ap_b     = template_norm * aper(H*K, r_phi)  — low-res convolved template aperture flux
+        ap_f     = template_norm * aper(H,   r_phi)  — high-res template aperture flux
+        apcor1   = ap_f / ap_b                       — shape correction (low-res→high-res)
+        ap_f_data = aper(F444W_residual + model_i, r_phi)   — REAL neighbour-subtracted
+                                                    F444W aperture flux (= ap_f + residual-in-aper)
+        tcor_H   = ftot / ap_f_data   (if a catalog total is supplied, else 1.0)
+                                                    — correction to the catalog total
+          The tcor_H denominator is the neighbour-subtracted F444W aperture flux
+          measured on data (not the noise-level template sum). The F444W residual
+          map (images[0] − Σ models) is built once and saved to
+          ``f444w_template_residual.fits`` for over-subtraction diagnosis; the
+          per-source ``ap_f_data`` is written to the ``apf_data_{idx}`` column.
 
-        With f444w_totals:   apcor = f444w_total / ap_B_real
-        Without f444w_totals: apcor = ap_F_real / ap_B_real  (PSF shape only)
+        ap_model     = fl * aper(H*K, r_phi)         (model flux in aperture, low-res)
+        res_sum      = Σ_aperture(residual)          (residual within the aperture disk)
+        res_seg      = Σ_segmap(residual)            (diagnostic only)
+        ap_flux      = ap_model + res_sum            (observed aperture flux)
+        ap_flux_corr = ap_model * apcor1 * tcor_H + res_sum   (Estimator 3 total)
 
-        ap_model     = fl * aper(H*K, r_img)          (MIRI model in aperture)
-        res_sum      = Σ_aperture(residual)           (residual within aperture)
-        res_seg      = Σ_segmap(residual)             (residual over full segmap)
-        ap_flux      = ap_model + res_sum             (observed aperture flux)
-        ap_flux_corr = ap_model * apcor + res_seg     (total: corrected model
-                                                       + residual flux outside
-                                                       the aperture, summed
-                                                       over the source segmap)
+        apcor1 and tcor_H are kept as separate factors and columns and are never
+        algebraically collapsed (their product is ftot/ap_b only when a catalog
+        total is given, else ap_f/ap_b). Per parent id, ap_model is accumulated
+        over any multi-component templates; the corrections and residual are
+        computed once.
 
-        Writes ap_model_{idx}, apcor_{idx}, res_sum_{idx}, res_seg_{idx},
-        ap_flux_{idx}, ap_flux_corr_{idx}.
+        Writes ap_model_{idx}, apcor1_{idx}, tcor_{idx}, apcor_{idx} (=product),
+        res_sum_{idx}, res_seg_{idx}, ap_flux_{idx}, ap_flux_corr_{idx}.
         """
         cfg = self.config
         id_to_row = {int(i): k for k, i in enumerate(cat["id"])}
@@ -585,6 +669,9 @@ class Pipeline:
         for name in (
             f"ap_model_{idx}",
             f"apcor_{idx}",
+            f"apcor1_{idx}",
+            f"tcor_{idx}",
+            f"apf_data_{idx}",
             f"res_sum_{idx}",
             f"res_seg_{idx}",
             f"ap_flux_{idx}",
@@ -595,6 +682,17 @@ class Pipeline:
 
         orig_by_id = {t.id: t for t in orig_templates} if orig_templates else {}
         use_tcor = f444w_totals is not None
+
+        # F444W neighbour-subtracted residual map (built once, reused across
+        # bands): the tcor_H denominator becomes the REAL neighbour-subtracted
+        # F444W aperture flux instead of the noise-level template sum. For each
+        # source we add its own model back via aperture-sum linearity:
+        #   ap_f_data = aper(residual + model_i) = aper(residual) + ap_f_template.
+        f444w_res = None
+        if orig_templates is not None:
+            if getattr(self, "_f444w_residual", None) is None:
+                self._f444w_residual = self._build_f444w_residual(orig_templates)
+            f444w_res = self._f444w_residual
 
         # Bin factor between the high-res segmap (F444W) and this image's
         # residual. k=1 when shapes already match (e.g. upsample mode).
@@ -608,6 +706,14 @@ class Pipeline:
             f"{'with tcor_H' if use_tcor else 'apcor1 only'})"
         )
 
+        # Accumulate the model aperture flux per parent id (multi-component
+        # templates share an id); the correction factors and the residual are
+        # computed once per parent. apcor1 and tcor_H are kept as SEPARATE
+        # factors (and columns) and never algebraically collapsed: their product
+        # is ftot/ap_b only when a catalog total is supplied, else ap_f/ap_b.
+        model_acc: dict[int, float] = defaultdict(float)
+        per: dict[int, dict] = {}
+
         for tmpl, fl in tqdm(zip(templates, fluxes), desc="Aperture corrections", total=len(templates)):
             row = id_to_row.get(int(tmpl.id))
             if row is None:
@@ -617,58 +723,105 @@ class Pipeline:
             if orig_t is None:
                 continue
 
-            flux_f444w_i = orig_t.flux_f444w
-            if flux_f444w_i <= 0:
+            template_norm_i = orig_t.template_norm
+            if template_norm_i <= 0:
                 continue
 
-            # Aperture fractions on normalised templates
+            # Convolved (low-res) aperture fraction of this (component) template.
             ap_B_frac = self._aperture_sum_on_template(tmpl, r_img_pix)
             if ap_B_frac <= 0:
                 continue
 
-            # Real-unit aperture fluxes (same calibration as catalog)
-            ap_B_real = flux_f444w_i * ap_B_frac
+            # Model flux inside the aperture (low-res grid), summed over any
+            # multi-component templates that share this parent id.
+            # APPROXIMATION (multi-component only): apcor1 below is computed from
+            # the FIRST (primary) component's shape and applied to this summed
+            # ap_model. This is EXACT for single-component sources (the default;
+            # multi_tmpl_psf_core/colour are off). For added PSF-core/colour
+            # components the secondary has no well-defined native-F444W shape, so
+            # its aperture correction uses the primary's apF/apB ratio -> a small
+            # bias on the (usually small) secondary flux. TODO: per-component apF.
+            model_acc[row] += fl * ap_B_frac
 
-            ap_model = fl * ap_B_frac
-            cat[f"ap_model_{idx}"][row] = ap_model
+            if row in per:
+                continue  # once-per-parent quantities already computed
 
-            # Same aperture geometry as _aperture_sum_on_template — applied to
-            # the residual patch on the matched in-bounds region. By linearity
-            # ap_flux = ap_model + res_sum exactly.
+            # --- once-per-parent correction factors and residual ---
+            # Real-unit template aperture fluxes (template_norm restores image
+            # flux units; it cancels in apcor1 but is required so tcor_H is
+            # dimensionless).
+            ap_b = template_norm_i * ap_B_frac  # low-res convolved template flux in aperture
+            ap_F_frac = self._aperture_sum_on_template(orig_t, r_orig_pix)
+            ap_f = template_norm_i * ap_F_frac if ap_F_frac > 0 else 0.0  # high-res template flux in aperture
+
+            # Shape correction: high-res / low-res aperture flux (real units).
+            # Uses the template shapes (a clean, bounded ratio ~PSF curve of growth).
+            apcor1 = ap_f / ap_b if (ap_b > 0 and ap_f > 0) else 1.0
+
+            # tcor_H denominator: the REAL neighbour-subtracted F444W aperture flux
+            # (template model_i + residual), measured on data rather than the
+            # noise-level template sum. By linearity this is ap_f (template) plus
+            # the F444W residual summed in the same aperture.
+            ap_f_data = ap_f
+            if f444w_res is not None:
+                ap_f_data = ap_f + self._aperture_sum_on_map(f444w_res, orig_t, r_orig_pix)
+
+            # Straight: tcor_H = f_f444w / (neighbour-subtracted F444W aperture
+            # flux). NO guard on the sign or zero of ap_f_data -- over-subtracted
+            # sources (ap_f_data <= 0) yield negative/inf tcor_H by design, so the
+            # over-subtraction is visible (inspect apf_data_{idx} + the residual
+            # map). tcor_H stays 1 only when no catalog total is supplied.
+            tcor_H = 1.0
+            if use_tcor:
+                ftot = f444w_totals.get(int(tmpl.id))
+                if ftot is not None and np.isfinite(ftot):
+                    tcor_H = float(np.float64(ftot) / np.float64(ap_f_data))
+
+            # Residual within the measurement aperture (disk), added UNSCALED.
+            # Same aperture geometry as _aperture_sum_on_template applied to the
+            # residual patch, so ap_flux = ap_model + res_sum exactly.
+            # TODO(blend residual double-count): for two close sources the aperture
+            # disks overlap, so background residual in the shared region is added to
+            # both ap_flux_corr values. Full fix would partition the shared residual.
+            # For now we at least exclude pixels that explicitly belong to OTHER
+            # sources' segments from this source's residual aperture.
+            res_patch = residual[tmpl.slices_original]
+            other = self._other_source_mask(tmpl, int(tmpl.id), k)
+            if other is not None and other.shape == res_patch.shape:
+                res_patch = res_patch * (~other)
             xc = tmpl.input_position_cutout[0] - tmpl.slices_cutout[1].start
             yc = tmpl.input_position_cutout[1] - tmpl.slices_cutout[0].start
             res_sum = float(
                 aperture_photometry(
-                    residual[tmpl.slices_original],
+                    res_patch,
                     CircularAperture((xc, yc), r=r_img_pix),
                     method="exact",
                 )["aperture_sum"][0]
             )
-            cat[f"res_sum_{idx}"][row] = res_sum
-            cat[f"ap_flux_{idx}"][row] = ap_model + res_sum
-
-            # Σ_segmap(res): residual integrated over the full segmap region.
-            # Carries the source's extended flux outside the aperture; used in
-            # ap_flux_corr so the final flux is a true total estimate.
+            # Residual over the full segmap (diagnostic only; not used in f3).
             res_seg = self._residual_segmap_sum(residual, int(tmpl.id), orig_t, k)
-            cat[f"res_seg_{idx}"][row] = res_seg
 
-            if use_tcor:
-                f444w_total = f444w_totals.get(int(tmpl.id))
-                if f444w_total is not None and np.isfinite(f444w_total):
-                    apcor = f444w_total / ap_B_real
-                    cat[f"apcor_{idx}"][row] = apcor
-                    cat[f"ap_flux_corr_{idx}"][row] = ap_model * apcor + res_seg
-                    continue
+            per[row] = dict(apcor1=apcor1, tcor=tcor_H, apf_data=ap_f_data,
+                            res_sum=res_sum, res_seg=res_seg)
 
-            # Without catalog total: PSF shape correction only
-            ap_F_frac = self._aperture_sum_on_template(orig_t, r_orig_pix)
-            if ap_F_frac <= 0:
-                continue
-            ap_F_real = flux_f444w_i * ap_F_frac
-            apcor = ap_F_real / ap_B_real
-            cat[f"apcor_{idx}"][row] = apcor
-            cat[f"ap_flux_corr_{idx}"][row] = ap_model * apcor + res_seg
+        # Write per-parent Estimator-3 results. The correction is applied as the
+        # explicit product apcor1 * tcor_H (never pre-collapsed).
+        for row, d in per.items():
+            ap_model = model_acc[row]
+            apcor1 = d["apcor1"]
+            tcor_H = d["tcor"]
+            res_sum = d["res_sum"]
+            cat[f"ap_model_{idx}"][row] = ap_model
+            cat[f"apcor1_{idx}"][row] = apcor1
+            cat[f"tcor_{idx}"][row] = tcor_H
+            cat[f"apf_data_{idx}"][row] = d["apf_data"]
+            cat[f"apcor_{idx}"][row] = apcor1 * tcor_H
+            cat[f"res_sum_{idx}"][row] = res_sum
+            cat[f"res_seg_{idx}"][row] = d["res_seg"]
+            cat[f"ap_flux_{idx}"][row] = ap_model + res_sum
+            # Estimator 3: model aperture flux scaled to total by the factored
+            # correction, plus the unscaled residual over the aperture disk.
+            cat[f"ap_flux_corr_{idx}"][row] = ap_model * apcor1 * tcor_H + res_sum
 
     def run(self, config: FitConfig | None = None) -> tuple[Table, list[np.ndarray]]:
         """Run photometry on the configured images.
@@ -724,59 +877,122 @@ class Pipeline:
             if config.f444w_col is not None and config.f444w_col in catalog.colnames:
                 cat[config.f444w_col] = catalog[config.f444w_col]
 
-        # --- PSF-wing extension of segmap-truncated templates (plan v3) -----
-        # Size the cutouts to hold the PSF wings *before* extraction, then extend
-        # every template whose segmap is smaller than the detection PSF's
-        # target-EE area. psfs[0] must be the detection-band (F444W = images[0])
-        # PSF; every dereference is guarded so legacy runs without PSFs are
-        # unaffected.
-        extend = bool(getattr(config, "extend_template_segmap", False))
-        detection_psf = None
+        # --- Representative detection-PSF growth curve (Estimator-3 plan v5) ---
+        # Cache one curve of growth near the mosaic centre so the 50/95/99% EE
+        # radii are available downstream for ownership sizing (rhalf_det = R50)
+        # and the template max-size cap (R95/R99). Reuses utils.psf_ee_radius_pix.
+        # psfs[0] is the detection-band (F444W = images[0]) PSF; all dereferences
+        # are guarded so legacy runs without PSFs are unaffected.
+        extend_mode = str(getattr(config, "template_extend_mode", "none"))
+        ee_cap = float(config.extend_template_ee)
+        self.detection_psf = None
+        self.ee_radii_pix: dict[float, float] = {}
+        self._f444w_residual = None  # rebuilt in _add_aperture_photometry (F444W neighbour-sub map)
         min_size = 8
-        if extend:
-            if psfs is None or len(psfs) == 0 or psfs[0] is None or wcs is None:
-                logger.warning(
-                    "extend_template_segmap=True but psfs[0]/wcs unavailable; "
-                    "skipping PSF-wing extension."
+        r_fill = 0.0  # extension fill radius (F444W px); 0 -> no extension
+        if psfs is not None and len(psfs) > 0 and psfs[0] is not None and wcs is not None:
+            psf0 = psfs[0]
+            # A spatially varying PSFRegionMap -> pick the widest region so every
+            # source has room; a plain ndarray is used directly.
+            if isinstance(psf0, PSFRegionMap):
+                rep_psf = max(
+                    (np.asarray(p, dtype=float) for p in psf0.psfs),
+                    key=lambda p: utils.psf_ee_radius_pix(p, ee_cap),
                 )
-                extend = False
             else:
-                # The detection PSF may be a single ndarray or a spatially
-                # varying PSFRegionMap; extend_with_psf_wings handles both.
-                detection_psf = psfs[0]
-                ee = float(config.extend_template_ee)
-                margin = float(config.extend_template_min_size_margin)
-                # Floor that holds the target-EE disk. psf_ee_radius_pix warns if
-                # a ring-negative matching kernel was passed instead of a PSF.
-                # For a region map, size for the widest region so every source
-                # has room (others may still FLAG_EXTEND_FAILED, never clip).
-                if isinstance(detection_psf, PSFRegionMap):
-                    ee_r = max(
-                        utils.psf_ee_radius_pix(np.asarray(p, dtype=float), ee)
-                        for p in detection_psf.psfs
-                    )
-                else:
-                    ee_r = utils.psf_ee_radius_pix(np.asarray(detection_psf, dtype=float), ee)
-                # Use ceil(ee_r) so the cutout half-extent clears the EE radius
-                # with integer headroom: extend_with_psf_wings fails a source
-                # whose EE disk does not fit, and at integer ee_r a tight floor
-                # would sit exactly on that boundary.
-                psf_floor = 2 * int(np.ceil(ee_r)) + int(np.ceil(margin))
-                psf_floor += psf_floor % 2
-                min_size = max(min_size, psf_floor)
-                # Also enclose the photometry aperture when it is a scalar arcsec
-                # diameter (np scalars included; per-source ndarray apertures skip).
-                if (
+                rep_psf = np.asarray(psf0, dtype=float)
+            self.detection_psf = rep_psf
+            for frac in sorted({0.5, 0.95, 0.99, ee_cap}):
+                try:
+                    self.ee_radii_pix[frac] = float(utils.psf_ee_radius_pix(rep_psf, frac))
+                except Exception as exc:  # pragma: no cover - PSF shape guard
+                    logger.warning("psf_ee_radius_pix(%.2f) failed: %s", frac, exc)
+            # When extending, choose the fill radius and pre-size cutouts to hold
+            # it *before* extraction so slice bookkeeping is correct from birth.
+            # r_fill = max(R95, aperture_radius_F444W + kernel_half_width): the
+            # template must cover the measurement aperture (plus a convolution
+            # margin so the convolved apB is valid out to that radius), and never
+            # be smaller than the R95 EE cap.
+            if extend_mode != "none":
+                r95 = self.ee_radii_pix.get(ee_cap)
+                r_fill = float(r95) if r95 is not None else 0.0
+
+                # F444W-grid aperture radius (scalar aperture; arcsec or pixels).
+                r_orig = None
+                scalar_ap = (
                     np.isscalar(config.aperture_diam)
                     and not isinstance(config.aperture_diam, str)
-                    and config.aperture_units == "arcsec"
-                ):
-                    min_size = max(
-                        min_size,
-                        Templates.min_size_from_aperture(
-                            float(config.aperture_diam), wcs[0], margin
-                        ),
-                    )
+                )
+                if scalar_ap and config.aperture_units == "arcsec":
+                    pscale_ref = self._pixel_scale_arcsec(wcs[0])
+                    if pscale_ref:
+                        r_orig = 0.5 * float(config.aperture_diam) / pscale_ref
+                elif scalar_ap and config.aperture_units == "pix":
+                    # aperture already in detection-grid pixels
+                    r_orig = 0.5 * float(config.aperture_diam)
+
+                # Largest matching-kernel EFFECTIVE half-width across the fitted
+                # bands (the 95% encircled radius of |K|, NOT the zero-padded
+                # array size -- otherwise large kernels would inflate template
+                # sizes/memory). This is the convolution margin so the convolved
+                # apB is valid out to the aperture radius.
+                kernel_hw = 0.0
+                for kern in (kernels or []):
+                    arr = None
+                    if isinstance(kern, PSFRegionMap):
+                        arr = np.asarray(kern.psfs[0], dtype=float) if len(kern.psfs) else None
+                    elif kern is not None:
+                        arr = np.asarray(kern, dtype=float)
+                    if arr is not None and arr.ndim == 2:
+                        a = np.abs(arr)
+                        if a.sum() > 0:
+                            try:
+                                kernel_hw = max(kernel_hw, utils.psf_ee_radius_pix(a, 0.95))
+                            except Exception:  # pragma: no cover - degenerate kernel
+                                pass
+
+                if r_orig is not None:
+                    r_fill = max(r_fill, r_orig + kernel_hw)
+
+                if r_fill > 0:
+                    floor = 2 * int(np.ceil(r_fill)) + 1
+                    floor += floor % 2
+                    min_size = max(min_size, floor)
+
+        # Template-extension parameters (Phase 2). The ownership/halo reach is
+        # r_fill = max(R95, aperture_radius + kernel_half_width), so the extended
+        # template covers the measurement aperture. Falls back to no extension if
+        # the PSF growth-curve / detection PSF is unavailable.
+        extract_kw: dict = {}
+        if extend_mode != "none":
+            if r_fill > 0 and psfs is not None and psfs[0] is not None:
+                det_weight = (
+                    weights[0] if (weights is not None and len(weights) > 0 and weights[0] is not None)
+                    else None
+                )
+                psf_ee_radius = self.ee_radii_pix.get(float(config.extend_template_ee))
+                extract_kw = dict(
+                    extend_mode=extend_mode,
+                    detection_psf=psfs[0],
+                    detection_weight=det_weight,
+                    max_radius_pix=float(r_fill),
+                    psf_ee_radius_pix=float(psf_ee_radius) if psf_ee_radius is not None else None,
+                    aperture_radius_pix=float(r_orig) if r_orig is not None else None,
+                    fit_snrlo_psf=float(config.fit_snrlo_psf),
+                    wings_snr_psf=float(config.wings_snr_psf),
+                )
+                logger.info(
+                    "Template extension (auto): every template extended to no more "
+                    "than %.1f pix (PSF-wing reach %.1f pix @ %.0f%% EE)",
+                    r_fill,
+                    psf_ee_radius if psf_ee_radius is not None else r_fill,
+                    100.0 * float(config.extend_template_ee),
+                )
+            else:
+                logger.warning(
+                    "template_extend_mode=%s but PSF growth-curve radii unavailable; "
+                    "extracting truncated templates (no extension).", extend_mode,
+                )
 
         self.tmpls = Templates(min_size=min_size)
         self.tmpls.extract_templates(
@@ -784,23 +1000,8 @@ class Pipeline:
             segmap,
             list(zip(cat["x"], cat["y"])),
             wcs=wcs[0] if wcs is not None else None,
+            **extract_kw,
         )
-        if extend:
-            self.tmpls.extend_with_psf_wings(
-                detection_psf, target_ee=float(config.extend_template_ee)
-            )
-            n_ext = sum(
-                bool(t.flag & Template.FLAG_PSF_EXTENDED) for t in self.tmpls.templates
-            )
-            n_fail = sum(
-                bool(t.flag & Template.FLAG_EXTEND_FAILED) for t in self.tmpls.templates
-            )
-            logger.info(
-                "PSF-wing extension: %d extended, %d failed/skipped of %d templates",
-                n_ext,
-                n_fail,
-                len(self.tmpls.templates),
-            )
         templates = self.tmpls.templates
         for t in templates:
             assert np.all(np.isfinite(t.data)), "Templates contain NaN values"
