@@ -429,6 +429,10 @@ class Template(Cutout2D):
         self.template_norm: float = 0.0  # within-segmap detection flux in image units (pre-normalization sum)
         self.n_pix: int = 0  # segmap pixel count at extraction time
         self.snr_seg: float = float("nan")  # in-segment detection SNR (set in _extended_composite); NaN if not extended
+        # True when this source's shape is unmeasurable (faint or bright+compact ->
+        # PSF-branch in _extended_composite): the aperture-to-total correction is then
+        # taken from the PSF curve of growth, not the (footprint-truncated) template.
+        self.apcor_from_psf: bool = False
         self.err = 0.0
         self.err_pred = 0.0  # predicted error from weight map and profile
         self.wnorm = 0.0  # weighted norm of the template d * w * d
@@ -1222,6 +1226,10 @@ class Templates:
         if psf_src is None or psf_src.sum() <= 0:
             cut.flag |= Template.FLAG_EXTEND_FAILED
             return img_stamp * ext_data  # fall back to real-data extension
+        # PSF is actually used from here on: the composite is point-source-like
+        # (faint) or PSF-winged compact, so its aperture-to-total correction should
+        # come from the PSF curve of growth (Phase A), not the truncated template.
+        cut.apcor_from_psf = True
         psf_total = float(psf_src.sum())
         pcy = (psf_src.shape[0] - 1) / 2.0
         pcx = (psf_src.shape[1] - 1) / 2.0

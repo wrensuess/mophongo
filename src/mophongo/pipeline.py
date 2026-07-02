@@ -705,6 +705,7 @@ class Pipeline:
             f"ap_model_{idx}",
             f"apcor_{idx}",
             f"apcor1_{idx}",
+            f"totcor1_{idx}",
             f"tcor_{idx}",
             f"apf_data_{idx}",
             f"aper_rphi_{idx}",
@@ -713,6 +714,7 @@ class Pipeline:
             f"res_sum_{idx}",
             f"res_seg_{idx}",
             f"ap_flux_{idx}",
+            f"ap_flux_est2_{idx}",
             f"ap_flux_corr_{idx}",
         ):
             if name not in cat.colnames:
@@ -744,6 +746,30 @@ class Pipeline:
             f"{'with tcor_H' if use_tcor else 'apcor1 only'})"
         )
 
+        # Phase A: point-source aperture-to-total from the PSF curve of growth for
+        # ``apcor_from_psf`` (faint / bright+compact) templates, whose shape is
+        # unmeasurable so the footprint-truncated template under-counts the total.
+        # apF = EE(PSF_hires, r_orig); apB = EE(PSF_band, r_img) -- the matching
+        # kernel makes PSF_hires⊗K = PSF_band, so the band PSF gives the convolved
+        # curve of growth directly. EE cached per PSF-region id (few distinct).
+        psf_hires = self.psfs[0] if (self.psfs is not None and len(self.psfs) > 0) else None
+        psf_band = self.psfs[idx] if (self.psfs is not None and len(self.psfs) > idx) else None
+        _ee_cache: dict = {}
+
+        def _psf_ee(psfmap, ra, dec, radius):
+            if psfmap is None:
+                return None
+            psf = psfmap.get_psf(ra, dec) if isinstance(psfmap, PSFRegionMap) else psfmap
+            if psf is None:
+                return None
+            key = (id(psf), float(radius))
+            if key not in _ee_cache:
+                try:
+                    _ee_cache[key] = utils.psf_ee_at_radius(psf, radius)
+                except Exception:  # pragma: no cover - degenerate PSF
+                    _ee_cache[key] = None
+            return _ee_cache[key]
+
         # Accumulate the model aperture flux per parent id (multi-component
         # templates share an id); the correction factors and the residual are
         # computed once per parent. apcor1 and tcor_H are kept as SEPARATE
@@ -765,8 +791,32 @@ class Pipeline:
             if template_norm_i <= 0:
                 continue
 
-            # Convolved (low-res) aperture fraction of this (component) template.
-            ap_B_frac = self._aperture_sum_on_template(tmpl, r_img_pix)
+            # Convolved (low-res) aperture fraction. For point-source-like
+            # (apcor_from_psf) templates use the band PSF curve of growth so the
+            # fraction is over the TRUE total, not the truncated template footprint.
+            use_psf = bool(getattr(orig_t, "apcor_from_psf", False))
+            ra_dec = None
+            ap_B_frac = None
+            if use_psf:
+                # Cutout-frame position with the cutout-adjusted WCS (the CRPIX is
+                # shifted to the cutout in Template.__init__; see the downsample
+                # convention in templates.py). position_original is the full-image
+                # frame and would give a wrong sky position -> wrong PSF region.
+                pos = orig_t.input_position_cutout
+                if getattr(orig_t, "wcs", None) is not None:
+                    ra_dec = orig_t.wcs.wcs_pix2world(pos[0], pos[1], 0)
+                else:
+                    ra_dec = pos
+                # Both fractions must come from the PSF, or neither: a mixed
+                # template/PSF apcor1 would not be a clean curve-of-growth ratio.
+                ee_b = _psf_ee(psf_band, ra_dec[0], ra_dec[1], r_img_pix)
+                ee_f = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix)
+                if (ee_b is not None and ee_b > 0) and (ee_f is not None and ee_f > 0):
+                    ap_B_frac = float(ee_b)
+                else:
+                    use_psf = False  # PSF unavailable -> template path for this source
+            if ap_B_frac is None:
+                ap_B_frac = self._aperture_sum_on_template(tmpl, r_img_pix)
             if ap_B_frac <= 0:
                 continue
 
@@ -789,12 +839,24 @@ class Pipeline:
             # flux units; it cancels in apcor1 but is required so tcor_H is
             # dimensionless).
             ap_b = template_norm_i * ap_B_frac  # low-res convolved template flux in aperture
-            ap_F_frac = self._aperture_sum_on_template(orig_t, r_orig_pix)
+            # High-res aperture fraction: PSF curve of growth for apcor_from_psf
+            # sources (same true-total normalisation as ap_B_frac above), else the
+            # template. Both from the same source so apcor1 is a clean bounded ratio.
+            ap_F_frac = None
+            if use_psf and ra_dec is not None:
+                ee_f = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix)
+                if ee_f is not None and ee_f > 0:
+                    ap_F_frac = float(ee_f)
+            if ap_F_frac is None:
+                ap_F_frac = self._aperture_sum_on_template(orig_t, r_orig_pix)
             ap_f = template_norm_i * ap_F_frac if ap_F_frac > 0 else 0.0  # high-res template flux in aperture
 
             # Shape correction: high-res / low-res aperture flux (real units).
             # Uses the template shapes (a clean, bounded ratio ~PSF curve of growth).
             apcor1 = ap_f / ap_b if (ap_b > 0 and ap_f > 0) else 1.0
+            # Internal aperture-to-total (design-doc Eq. 7; = IDL totcor). Bounded
+            # ~1.2 for apcor_from_psf sources now that apB is over the true total.
+            totcor1 = 1.0 / ap_B_frac if ap_B_frac > 0 else 1.0
 
             # tcor_H denominator: the REAL neighbour-subtracted F444W aperture flux
             # (template model_i + residual), measured on data rather than the
@@ -813,7 +875,7 @@ class Pipeline:
             aper_rphi = ap_f_data
             tcor_w = 1.0
             aper_small = float(cfg.bad_value)
-            if r_small_pix is not None and f444w_res is not None:
+            if r_small_pix is not None and f444w_res is not None and not use_psf:
                 tcor_w = self._tcor_blend_weight(
                     getattr(orig_t, "snr_seg", float("nan")),
                     cfg.tcor_blend_center * cfg.fit_snrlo_psf,
@@ -863,7 +925,7 @@ class Pipeline:
             # Residual over the full segmap (diagnostic only; not used in f3).
             res_seg = self._residual_segmap_sum(residual, int(tmpl.id), orig_t, k)
 
-            per[row] = dict(apcor1=apcor1, tcor=tcor_H, apf_data=ap_f_data,
+            per[row] = dict(apcor1=apcor1, totcor1=totcor1, tcor=tcor_H, apf_data=ap_f_data,
                             aper_rphi=aper_rphi, tcor_w=tcor_w, aper_small=aper_small,
                             res_sum=res_sum, res_seg=res_seg)
 
@@ -872,10 +934,12 @@ class Pipeline:
         for row, d in per.items():
             ap_model = model_acc[row]
             apcor1 = d["apcor1"]
+            totcor1 = d["totcor1"]
             tcor_H = d["tcor"]
             res_sum = d["res_sum"]
             cat[f"ap_model_{idx}"][row] = ap_model
             cat[f"apcor1_{idx}"][row] = apcor1
+            cat[f"totcor1_{idx}"][row] = totcor1
             cat[f"tcor_{idx}"][row] = tcor_H
             cat[f"apf_data_{idx}"][row] = d["apf_data"]
             cat[f"aper_rphi_{idx}"][row] = d["aper_rphi"]
@@ -885,6 +949,9 @@ class Pipeline:
             cat[f"res_sum_{idx}"][row] = res_sum
             cat[f"res_seg_{idx}"][row] = d["res_seg"]
             cat[f"ap_flux_{idx}"][row] = ap_model + res_sum
+            # Estimator 2 (IDL-consistent): model aperture flux scaled to total by
+            # the internal template curve of growth (totcor1 = 1/apB), + residual.
+            cat[f"ap_flux_est2_{idx}"][row] = ap_model * totcor1 + res_sum
             # Estimator 3: model aperture flux scaled to total by the factored
             # correction, plus the unscaled residual over the aperture disk.
             cat[f"ap_flux_corr_{idx}"][row] = ap_model * apcor1 * tcor_H + res_sum

@@ -136,6 +136,45 @@ def psf_ee_radius_pix(psf: np.ndarray, ee_fraction: float = 0.95) -> float:
     return float(np.interp(ee_fraction, frac, cog.radius))
 
 
+def psf_ee_at_radius(psf: np.ndarray, radius_pix: float) -> float:
+    """Encircled-energy fraction of ``psf`` within ``radius_pix`` (inverse of
+    :func:`psf_ee_radius_pix`).
+
+    Same :class:`~photutils.profiles.CurveOfGrowth` convention and normalisation
+    by ``psf.sum()`` (the true total) as :func:`psf_ee_radius_pix`, so the two are
+    consistent. Used for the point-source aperture-to-total correction of
+    ``apcor_from_psf`` templates, whose shape is unmeasurable and taken from the
+    PSF curve of growth rather than the footprint-truncated template.
+
+    Parameters
+    ----------
+    psf : np.ndarray
+        2-D PSF centred at ``(shape - 1) / 2``.
+    radius_pix : float
+        Aperture radius in pixels.
+
+    Returns
+    -------
+    float
+        Fraction of the full PSF flux enclosed within ``radius_pix``.
+    """
+    psf = np.asarray(psf, dtype=float)
+    total = float(psf.sum())
+    if total <= 0:
+        raise ValueError("psf.sum() must be positive to define encircled energy")
+
+    ny, nx = psf.shape
+    xc, yc = (nx - 1) / 2.0, (ny - 1) / 2.0
+    r_max = min(xc, yc)
+    if r_max < 1:
+        raise ValueError("psf too small to measure encircled energy")
+    radii = np.arange(0.5, r_max, 0.5)
+
+    cog = CurveOfGrowth(psf, (xc, yc), radii)
+    frac = cog.profile / total
+    return float(np.interp(float(radius_pix), cog.radius, frac))
+
+
 def psf_ee_area_pix(psf: np.ndarray, ee_fraction: float = 0.95) -> int:
     """Area in pixels of the circle enclosing ``ee_fraction`` of ``psf.sum()``.
 
