@@ -428,6 +428,7 @@ class Template(Cutout2D):
         self.flux = 0.0
         self.template_norm: float = 0.0  # within-segmap detection flux in image units (pre-normalization sum)
         self.n_pix: int = 0  # segmap pixel count at extraction time
+        self.snr_seg: float = float("nan")  # in-segment detection SNR (set in _extended_composite); NaN if not extended
         self.err = 0.0
         self.err_pred = 0.0  # predicted error from weight map and profile
         self.wnorm = 0.0  # weighted norm of the template d * w * d
@@ -1202,6 +1203,7 @@ class Templates:
         # TODO(wings-snr-radius): revisit whether the full owned halo
         # (max_radius_pix) should be used here instead of the aperture radius.
         snr_seg, e_seg = self._region_snr(img_stamp, ivar_stamp, own, bg_rms)
+        cut.snr_seg = float(snr_seg)  # persist for the low-SNR tcor_H blend in _add_aperture_photometry
         ap_r = aperture_radius_pix if aperture_radius_pix is not None else max_radius_pix
         wings_in_ap = bg_owned & (r2 <= float(ap_r) ** 2)
         snr_wings, _ = self._region_snr(img_stamp, ivar_stamp, wings_in_ap, bg_rms)

@@ -472,6 +472,23 @@ class Pipeline:
         phot = aperture_photometry(fullmap[tmpl.slices_original], aper, method="exact")
         return float(phot["aperture_sum"][0])
 
+    @staticmethod
+    def _tcor_blend_weight(snr_seg: float, center: float, width: float) -> float:
+        """Smooth logistic weight for the low-SNR tcor_H denominator blend.
+
+        w -> 1 at high ``snr_seg`` (trust the direct Rphi measurement ``ap_f_data``),
+        w -> 0 at low ``snr_seg`` (trust the small-aperture + template-growth estimate).
+        NaN ``snr_seg`` (e.g. non-extended templates) returns 1.0 so those sources keep
+        the current direct path. ``center``/``width`` are in ``snr_seg`` units (width is
+        the logistic scale = ``width*center``).
+        """
+        if not np.isfinite(snr_seg):
+            return 1.0
+        scale = max(float(width) * float(center), 1e-6)
+        # clip the logistic argument so np.exp cannot overflow for extreme SNR/params
+        z = np.clip((float(snr_seg) - float(center)) / scale, -700.0, 700.0)
+        return float(1.0 / (1.0 + np.exp(-z)))
+
     def _build_f444w_residual(self, orig_templates: list[Template]) -> np.ndarray:
         """F444W neighbour-subtracted residual map: images[0] - Σ_j model_j.
 
@@ -666,12 +683,33 @@ class Pipeline:
             pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
             r_orig_pix = r_img_pix * pscale_img / pscale_ref if (pscale_img and pscale_ref) else r_img_pix
 
+        # Low-SNR tcor_H: anchor radius r_small = where the representative detection PSF
+        # (F444W-grid sampled, same units as r_orig_pix) reaches tcor_anchor_ee of its
+        # flux. One scalar per band; the growth to Rphi is the source's OWN template
+        # curve (per source, below). r_small_pix=None disables the blend (-> current path).
+        r_small_pix = None
+        if cfg.tcor_lowsnr_psf and getattr(self, "detection_psf", None) is not None:
+            from . import utils
+            try:
+                r_small_pix = float(utils.psf_ee_radius_pix(self.detection_psf, cfg.tcor_anchor_ee))
+                if not (0.0 < r_small_pix < float(r_orig_pix)):
+                    logger.warning(
+                        "tcor low-SNR blend disabled (image %d): r_small=%.3f not in (0, r_phi=%.3f) px",
+                        idx, r_small_pix, float(r_orig_pix))
+                    r_small_pix = None
+            except Exception as exc:  # pragma: no cover - degrade to current path
+                logger.warning("tcor low-SNR blend disabled (image %d): PSF EE radius failed: %s", idx, exc)
+                r_small_pix = None
+
         for name in (
             f"ap_model_{idx}",
             f"apcor_{idx}",
             f"apcor1_{idx}",
             f"tcor_{idx}",
             f"apf_data_{idx}",
+            f"aper_rphi_{idx}",
+            f"tcor_w_{idx}",
+            f"aper_small_{idx}",
             f"res_sum_{idx}",
             f"res_seg_{idx}",
             f"ap_flux_{idx}",
@@ -766,16 +804,40 @@ class Pipeline:
             if f444w_res is not None:
                 ap_f_data = ap_f + self._aperture_sum_on_map(f444w_res, orig_t, r_orig_pix)
 
-            # Straight: tcor_H = f_f444w / (neighbour-subtracted F444W aperture
-            # flux). NO guard on the sign or zero of ap_f_data -- over-subtracted
-            # sources (ap_f_data <= 0) yield negative/inf tcor_H by design, so the
-            # over-subtraction is visible (inspect apf_data_{idx} + the residual
-            # map). tcor_H stays 1 only when no catalog total is supplied.
+            # Low-SNR blend: the full-Rphi measurement ap_f_data is noise-dominated for
+            # faint sources (~707 px of sky). Blend it smoothly toward est_growth = the
+            # deblended flux in a small high-SNR aperture (r_small) scaled to Rphi by the
+            # source's OWN template curve of growth. Both estimate the same quantity
+            # (deblended F444W flux in Rphi), so the convex blend is a weighted average.
+            # w -> 1 (high snr_seg) reproduces ap_f_data exactly; w -> 0 uses est_growth.
+            aper_rphi = ap_f_data
+            tcor_w = 1.0
+            aper_small = float(cfg.bad_value)
+            if r_small_pix is not None and f444w_res is not None:
+                tcor_w = self._tcor_blend_weight(
+                    getattr(orig_t, "snr_seg", float("nan")),
+                    cfg.tcor_blend_center * cfg.fit_snrlo_psf,
+                    cfg.tcor_blend_width,
+                )
+                if tcor_w < 1.0:
+                    apF_frac_s = self._aperture_sum_on_template(orig_t, r_small_pix)
+                    if apF_frac_s > 0:
+                        aper_small = (template_norm_i * apF_frac_s
+                                      + self._aperture_sum_on_map(f444w_res, orig_t, r_small_pix))
+                        est_growth = aper_small * (ap_F_frac / apF_frac_s)
+                        # Never form 0*inf (a FLAG_SUM_ZERO template gives apF_frac_s->0):
+                        # only blend a finite growth estimate, else keep ap_f_data.
+                        if np.isfinite(est_growth):
+                            aper_rphi = tcor_w * ap_f_data + (1.0 - tcor_w) * est_growth
+
+            # tcor_H = f_f444w / aper_rphi (blended). NO guard on the sign/zero of
+            # aper_rphi -- over-subtracted sources yield negative/inf by design
+            # (inspect apf_data_/aper_rphi_/tcor_w_{idx}). Stays 1 without a catalog total.
             tcor_H = 1.0
             if use_tcor:
                 ftot = f444w_totals.get(int(tmpl.id))
                 if ftot is not None and np.isfinite(ftot):
-                    tcor_H = float(np.float64(ftot) / np.float64(ap_f_data))
+                    tcor_H = float(np.float64(ftot) / np.float64(aper_rphi))
 
             # Residual within the measurement aperture (disk), added UNSCALED.
             # Same aperture geometry as _aperture_sum_on_template applied to the
@@ -802,6 +864,7 @@ class Pipeline:
             res_seg = self._residual_segmap_sum(residual, int(tmpl.id), orig_t, k)
 
             per[row] = dict(apcor1=apcor1, tcor=tcor_H, apf_data=ap_f_data,
+                            aper_rphi=aper_rphi, tcor_w=tcor_w, aper_small=aper_small,
                             res_sum=res_sum, res_seg=res_seg)
 
         # Write per-parent Estimator-3 results. The correction is applied as the
@@ -815,6 +878,9 @@ class Pipeline:
             cat[f"apcor1_{idx}"][row] = apcor1
             cat[f"tcor_{idx}"][row] = tcor_H
             cat[f"apf_data_{idx}"][row] = d["apf_data"]
+            cat[f"aper_rphi_{idx}"][row] = d["aper_rphi"]
+            cat[f"tcor_w_{idx}"][row] = d["tcor_w"]
+            cat[f"aper_small_{idx}"][row] = d["aper_small"]
             cat[f"apcor_{idx}"][row] = apcor1 * tcor_H
             cat[f"res_sum_{idx}"][row] = res_sum
             cat[f"res_seg_{idx}"][row] = d["res_seg"]

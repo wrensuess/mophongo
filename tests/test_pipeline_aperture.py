@@ -84,6 +84,82 @@ def test_aperture_photometry_with_tcor():
     assert cat["ap_flux_corr_1"][0] == pytest.approx(fl * f444w_total / template_norm_i)
 
 
+# --- low-SNR template-growth-blended tcor_H denominator -----------------------
+
+def _gauss(n, sigma):
+    c = (n - 1) / 2.0
+    y, x = np.mgrid[0:n, 0:n]
+    p = np.exp(-((x - c) ** 2 + (y - c) ** 2) / (2 * sigma ** 2))
+    return p / p.sum()
+
+
+def _lowsnr_setup(snr_seg=1.0, enable=True, with_psf=True, template_norm=25.0):
+    """Pipeline whose F444W image == the source's own model (residual=0), so the
+    growth estimator is EXACT: est_growth == ap_f_data for any blend weight."""
+    from mophongo.fit import FitConfig
+    n, tn = 25, template_norm
+    c = n // 2
+    prof = _gauss(n, 2.5)  # peaked profile -> non-trivial growth ratio
+    conv = Template(prof.copy(), (c, c), (n, n), label=1)
+    conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1)
+    orig.template_norm = tn
+    orig.snr_seg = snr_seg
+    img = np.zeros((n, n))
+    img[orig.slices_original] += orig.data[orig.slices_cutout] * tn
+    cfg = FitConfig(tcor_lowsnr_psf=enable, tcor_anchor_ee=0.70,
+                    tcor_blend_center=1.5, fit_snrlo_psf=10.0)
+    pl = Pipeline([img], np.zeros((n, n)), config=cfg)
+    pl.psfs = [np.ones((5, 5))]
+    pl.detection_psf = _gauss(15, 1.5) if with_psf else None
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(
+        cat, [conv], np.array([2.0]), np.zeros((n, n)), 1,
+        r_orig_pix=5.0, orig_templates=[orig], f444w_totals={1: 42.0},
+    )
+    return cat
+
+
+def test_tcor_lowsnr_disabled_by_default():
+    """Default FitConfig (tcor_lowsnr_psf=False): blend inactive, w=1, denom unchanged."""
+    cat = _lowsnr_setup(snr_seg=1.0, enable=False)
+    assert cat["tcor_w_1"][0] == pytest.approx(1.0)
+    assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
+    assert cat["tcor_1"][0] == pytest.approx(42.0 / cat["apf_data_1"][0])
+
+
+def test_tcor_lowsnr_high_snr_identity():
+    """Enabled but high snr_seg -> w rounds to 1.0 -> denom bit-identical to ap_f_data."""
+    cat = _lowsnr_setup(snr_seg=1000.0, enable=True)
+    assert cat["tcor_w_1"][0] == pytest.approx(1.0)
+    assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
+
+
+def test_tcor_lowsnr_blend_exact_when_data_follows_template():
+    """Low snr_seg -> blend active (w<1), but with residual=0 the growth estimate is
+    EXACT (est_growth == ap_f_data), so the blended denominator is unchanged."""
+    cat = _lowsnr_setup(snr_seg=1.0, enable=True)
+    assert cat["tcor_w_1"][0] < 1.0                       # blend is active
+    assert np.isfinite(cat["aper_small_1"][0]) and cat["aper_small_1"][0] > 0
+    # est_growth == ap_f_data exactly -> aper_rphi unchanged regardless of weight
+    assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
+    assert cat["tcor_1"][0] == pytest.approx(42.0 / cat["apf_data_1"][0])
+
+
+def test_tcor_lowsnr_nan_snr_no_op():
+    """NaN snr_seg (non-extended template) -> w=1 even when enabled."""
+    cat = _lowsnr_setup(snr_seg=float("nan"), enable=True)
+    assert cat["tcor_w_1"][0] == pytest.approx(1.0)
+    assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
+
+
+def test_tcor_lowsnr_no_psf_no_op():
+    """Enabled but no detection PSF -> r_small unavailable -> blend no-ops to direct."""
+    cat = _lowsnr_setup(snr_seg=1.0, enable=True, with_psf=False)
+    assert cat["tcor_w_1"][0] == pytest.approx(1.0)
+    assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
+
+
 def test_residual_segmap_sum_same_res():
     """k=1: sum residual only over (segmap == source_id), ignore flux outside."""
     segmap = np.zeros((10, 10), dtype=int)

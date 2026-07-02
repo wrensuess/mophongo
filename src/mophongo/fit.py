@@ -115,6 +115,17 @@ class FitConfig:
     # of real data (compact -> PSF wings; extended -> real data).
     wings_snr_psf: float = 3.0
     extend_template_ee: float = 0.95  # encircled-energy fraction: PSF-wing reach & max template-size cap
+    # --- low-SNR tcor_H: template-growth-blended aperture-to-total denominator ---
+    # For faint sources aper_F444W(Rphi) is a noise-dominated raw sum over ~707 px; the
+    # tcor_H denominator is instead blended toward a small high-SNR aperture scaled to Rphi
+    # by the source's own template curve of growth. See Pipeline._add_aperture_photometry.
+    # TODO: these three are sweep knobs for validation. Once good values are found, hard-set
+    # the blend center/width (and likely the anchor) in code and drop them from user config --
+    # some choices here are simply wrong and should not stay open user controls.
+    tcor_lowsnr_psf: bool = False  # master switch; False => tcor_H is bit-for-bit the current value
+    tcor_anchor_ee: float = 0.70  # EE fraction of the representative PSF defining r_small
+    tcor_blend_center: float = 1.5  # logistic center = tcor_blend_center * fit_snrlo_psf (in snr_seg)
+    tcor_blend_width: float = 0.30  # logistic width as a fraction of the center
     # --- deprecated PSF-wing extension flags (broken in-place implementation; do not use) ---
     extend_template_segmap: bool = False  # DEPRECATED: old in-place extension, kept False
     extend_template_min_size_margin: float = 1.5  # cutout margin for min_size sizing
