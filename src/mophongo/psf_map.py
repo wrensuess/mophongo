@@ -51,6 +51,12 @@ class PSFRegionMap:
     # optional ndarray to store PSF kernels as a lookup table
     psfs: np.ndarray | None = None
 
+    # per-region fraction of the PSF's TRUE total flux contained within the
+    # stored stamp (docs/aperture_corrections.md Sec 4.1/5.2). Array aligned
+    # with ``psfs`` (indexed by psf_key); a scalar (the default, 1.0) applies
+    # uniformly to every region -- see ``get_containment``.
+    containment: np.ndarray | float = 1.0
+
     # ------------------------------------------------------------------
     # orientation helper
     # ------------------------------------------------------------------
@@ -253,8 +259,33 @@ class PSFRegionMap:
         else:
             logging.warning(f"No PSFs found for {geojson_path}, using None.")
 
+        # containment: per-region fraction of the PSF's TRUE total flux inside
+        # the stored stamp (docs/aperture_corrections.md Sec 4.1/5.2). Older
+        # geojsons predate this column -- default to 1.0 and warn loudly,
+        # since EE-based corrections then silently stay stamp-normalized.
+        if "containment" in regions_gdf.columns:
+            keys = regions_gdf["psf_key"].to_numpy()
+            vals = regions_gdf["containment"].to_numpy(dtype=float)
+            n_bad = int((~np.isfinite(vals)).sum())
+            if n_bad:
+                logging.warning(
+                    f"{geojson_path}: {n_bad}/{len(vals)} non-finite 'containment' "
+                    "values -- EE-based corrections will be NaN in those regions "
+                    "(docs/aperture_corrections.md Sec 4.1/5.2)."
+                )
+            containment = np.ones(int(keys.max()) + 1 if len(keys) else 0, dtype=float)
+            containment[keys] = vals
+        else:
+            logging.warning(
+                f"{geojson_path}: no 'containment' column -- this map predates "
+                "PSF stamp containment; defaulting to 1.0 (EE-based corrections "
+                "will stay stamp-normalized, docs/aperture_corrections.md Sec 4.1/5.2)."
+            )
+            containment = 1.0
+
         base_name = os.path.splitext(os.path.basename(geojson_path))[0]
-        return cls(regions=regions_gdf, psfs=psfs, name=base_name, **kwargs)
+        return cls(regions=regions_gdf, psfs=psfs, name=base_name,
+                    containment=containment, **kwargs)
 
     # =================================================================
     # public grouping methods
@@ -266,8 +297,11 @@ class PSFRegionMap:
         crs: str | None = "EPSG:4326",
     ) -> "PSFRegionMap":
         """
-        Merge regions where all contributing frames share the same PA class AND 
+        Merge regions where all contributing frames share the same PA class AND
         detector exposure time profile (relative contributions).
+
+        Note: ``psfs``/``containment`` are NOT forwarded to the returned map
+        (regions change); callers assign them afterwards.
         """
         from collections import defaultdict
         
@@ -378,6 +412,9 @@ class PSFRegionMap:
         Compute the overlay (intersection) of this PSFRegionMap with another PSFRegionMap
         or a single Polygon. Returns a new PSFRegionMap whose regions are the spatial
         intersections of the input maps, with psf_key pairs (or single key if Polygon).
+
+        Note: ``psfs``/``containment`` are NOT forwarded to the returned map
+        (regions change); callers assign them afterwards.
         """
         import geopandas as gpd
         from shapely.geometry import Polygon
@@ -543,25 +580,51 @@ class PSFRegionMap:
             return int(self.regions.psf_key.iloc[nearest_idx])
         return None
 
-    def get_psf(self, ra: float | None, dec: float | None) -> np.ndarray | None:
+    def resolve_key(self, ra: float | None, dec: float | None) -> int:
+        """Region psf_key at (ra, dec), falling back to 0 for missing/NaN
+        coordinates or a failed lookup. Single source of truth for the region
+        resolution shared by ``get_psf`` and ``get_containment``; callers
+        needing both (e.g. the pipeline EE cache) should resolve the key once
+        and index directly so the PSF and its containment cannot diverge.
+        """
         if ra is None or dec is None or np.isnan(ra) or np.isnan(dec):
-            key = 0
             logging.warning("RA/Dec is None or NaN, returning default kernel at index 0.")
-        else:
-            key = self.lookup_key(ra, dec)
-            if key is None or np.isnan(key):
-                logging.warning("key are requested ra,dec is None or NaN, returning default kernel at index 0.")
-                key = 0
+            return 0
+        key = self.lookup_key(ra, dec)
+        if key is None or np.isnan(key):
+            logging.warning("key are requested ra,dec is None or NaN, returning default kernel at index 0.")
+            return 0
+        return int(key)
 
-        return self.psfs[key]
+    def get_psf(self, ra: float | None, dec: float | None) -> np.ndarray | None:
+        return self.psfs[self.resolve_key(ra, dec)]
+
+    def get_containment(self, ra: float | None, dec: float | None) -> float:
+        """Return the per-region PSF containment fraction at (ra, dec) --
+        the fraction of the PSF's TRUE total flux inside the stored stamp
+        (mirrors ``get_psf``). Falls back to 1.0 when containment is unset
+        (scalar) or ra/dec is missing.
+        """
+        c = self.containment
+        if c is None or np.isscalar(c):
+            return 1.0 if c is None else float(c)
+        return float(c[self.resolve_key(ra, dec)])
 
     def to_file(self, filename, driver="GeoJSON"):
         """
         Save regions to GeoJSON and PSFs to a .fits file with the same base name.
         """
         from astropy.io import fits
-        # Save regions
-        self.regions.to_file(filename, driver=driver)
+        # Save regions, with the per-region containment as a column (broadcast
+        # from a scalar if uniform) so it round-trips through from_geojson.
+        regions = self.regions
+        if self.containment is not None:
+            keys = regions["psf_key"].to_numpy()
+            n = int(keys.max()) + 1 if len(keys) else 0
+            cont = np.broadcast_to(self.containment, n).astype(float)
+            regions = regions.copy()
+            regions["containment"] = cont[keys]
+        regions.to_file(filename, driver=driver)
         # Save PSFs if present
         if self.psfs is not None:
             fits.writeto(str(filename).replace('.geojson', '.fits'), self.psfs, overwrite=True)

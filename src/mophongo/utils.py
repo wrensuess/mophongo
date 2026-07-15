@@ -186,6 +186,44 @@ def psf_ee_area_pix(psf: np.ndarray, ee_fraction: float = 0.95) -> int:
     return int(np.ceil(np.pi * r * r))
 
 
+def psf_stamp_containment(parent_psfs: np.ndarray, parent_pscale: float,
+                           stamp_width_arcsec: float) -> float:
+    """Median fraction of each parent PSF's total flux inside the centred
+    INSCRIBED DISK of radius ``stamp_width_arcsec / 2`` -- the true-total
+    "containment" of a finite PSF stamp (docs/aperture_corrections.md
+    Sec 4.1/5.2). The disk, not the square, is the right geometry because
+    the drizzled region-map stamps are circularly apodized: their corner
+    pixels are identically zero, so the stamp sum is a disk sum and a box
+    fraction would over-count corner flux that is not in the stamp.
+
+    ``parent_psfs`` are large-support PSFs (e.g. the 8" STPSF grids), each
+    centred at ``(shape - 1) / 2``, at pixel scale ``parent_pscale``
+    (arcsec/pixel). Uses the same curve-of-growth convention as
+    :func:`psf_ee_at_radius`.
+
+    Parameters
+    ----------
+    parent_psfs : np.ndarray
+        Stack of 2-D PSF stamps, shape ``(N, ny, nx)`` (or a single ``(ny, nx)``).
+    parent_pscale : float
+        Pixel scale of ``parent_psfs`` in arcsec/pixel.
+    stamp_width_arcsec : float
+        Width of the stamp, in arcsec; the disk radius is half this.
+
+    Returns
+    -------
+    float
+        Median inscribed-disk containment fraction across all input PSFs.
+    """
+    parent_psfs = np.asarray(parent_psfs, dtype=float)
+    if parent_psfs.ndim == 2:
+        parent_psfs = parent_psfs[None]
+
+    radius_pix = 0.5 * stamp_width_arcsec / parent_pscale
+    fracs = [psf_ee_at_radius(psf, radius_pix) for psf in parent_psfs if psf.sum() > 0]
+    return float(np.median(fracs))
+
+
 def bin_factor_from_wcs(w_det: WCS, w_img: WCS, tol: float = 0.001) -> int:
     """Return the integer pixel-scale factor between two WCS objects.
 

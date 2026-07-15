@@ -288,7 +288,7 @@ full PSF flux:
 | Measurement | Value |
 |---|---|
 | EE_F1500W(0.6") normalized to the 3" geojson stamp | 0.8115 → totcor1 = 1.2323 — reproduces the fit table's 1.233 exactly |
-| Fraction of true F1500W PSF flux inside the 3" stamp (8" STPSF grid `UDS_MIRI_F1500W_OS4_GRID9.fits`) | **0.9192** |
+| Fraction of true F1500W PSF flux inside the 3" stamp (8" STPSF grid `UDS_MIRI_F1500W_OS4_GRID9.fits`; inscribed-disk fraction — the drizzled stamps are circularly apodized, corner pixels identically zero) | **0.9192** |
 | EE_F1500W(0.6") normalized to the 8" grid | 0.7427 → totcor1 = **1.3465** — matches IDL's 1.357 to <1% |
 | EE_F444W(0.6"), 3"-stamp vs 8"-grid | 0.9428 vs 0.9037 (stamp holds 96.2%) |
 | resulting true apcor1 | 1.217 (IDL `psfcor` 1.255; residual ~3% — §7) |
@@ -417,9 +417,14 @@ adopted at the same time so non-detections blend fully to the PSF.
   flux contained within the stored stamp (standard PSF "containment" in the STPSF/JWST
   sense) — computed where the PSFs are built: the geojson region PSFs are drizzled from
   STPSF grid parents with 8" support, so the constructor can record the contained fraction.
-  Serialized in the geojson; defaults to 1.0 for plain arrays and old files. Measured values
-  for the current setup: F444W ≈ 0.962, F1500W ≈ 0.919 (per band; values depend on
-  `psf_size`).
+  The drizzled stamps are circularly apodized (corner pixels identically zero; support
+  radius ≈ inscribed radius), so the correct definition is the **inscribed-disk** flux
+  fraction at r = stamp width / 2, not a square-box fraction (which would over-count ~1%
+  corner flux that is not in the stamp sum). Serialized in the geojson; defaults to 1.0 for
+  plain arrays and old files. Measured values for the current setup: F444W ≈ 0.962 (r =
+  1.50"), F1500W ≈ 0.919 (r = 1.56") (per band; values depend on `psf_size`). The residual
+  ~0.4% between this and the empirically-required factor (0.9152 at F1500W) is a genuine
+  drizzle-vs-parent core-shape difference, filed with the §7 EE-residual open item.
 - `EE_true(r) = EE_stamp(r) × containment` wherever a PSF curve of growth is used in
   correction factors. Template-based fractions get the analogous stamp-edge extrapolation
   via the band PSF's `containment` at the template's outer radius (a ≲1.5% effect for the

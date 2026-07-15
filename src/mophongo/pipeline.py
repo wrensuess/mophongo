@@ -781,13 +781,30 @@ class Pipeline:
         def _psf_ee(psfmap, ra, dec, radius):
             if psfmap is None:
                 return None
-            psf = psfmap.get_psf(ra, dec) if isinstance(psfmap, PSFRegionMap) else psfmap
+            # Cache key: (psfmap identity, region, radius) -- NOT id(psf):
+            # PSFRegionMap.get_psf returns a fresh ndarray view per call and
+            # CPython reuses freed ids, so id(psf) collided across regions
+            # (pre-existing since Phase A). The region key is resolved ONCE
+            # and reused for the PSF and its containment so they cannot diverge.
+            if isinstance(psfmap, PSFRegionMap):
+                region = psfmap.resolve_key(ra, dec)
+                psf = psfmap.psfs[region]
+                c = psfmap.containment
+                containment = 1.0 if c is None else float(c if np.isscalar(c) else c[region])
+            else:
+                region = None
+                psf = psfmap
+                containment = 1.0
             if psf is None:
                 return None
-            key = (id(psf), float(radius))
+            key = (id(psfmap), region, float(radius))
             if key not in _ee_cache:
                 try:
-                    _ee_cache[key] = utils.psf_ee_at_radius(psf, radius)
+                    # True-total normalization (docs/aperture_corrections.md
+                    # Sec 4.1/5.2): psf_ee_at_radius is stamp-normalized, so
+                    # multiply by the region's containment (fraction of the
+                    # PSF's true total flux in the stamp). ndarray PSFs -> 1.0.
+                    _ee_cache[key] = utils.psf_ee_at_radius(psf, radius) * containment
                 except Exception:  # pragma: no cover - degenerate PSF
                     _ee_cache[key] = None
             return _ee_cache[key]
@@ -825,6 +842,10 @@ class Pipeline:
             # this feeds apcor1/totcor1 ONLY, never the bookkeeping above.
             use_psf = bool(getattr(orig_t, "apcor_from_psf", False))
             ra_dec = None
+            # Template-path default (apcor_from_psf False, or PSF unavailable below):
+            # apB_corr stays the footprint-truncated template fraction, with no
+            # stamp-edge extrapolation. Scope cut vs docs/aperture_corrections.md
+            # Sec 5.2 bullet 2 -- deferred to Stage 4 (≲1.5% effect per Sec 4.1).
             apB_corr = apB_book
             if use_psf:
                 # Cutout-frame position with the cutout-adjusted WCS (the CRPIX is
@@ -876,6 +897,8 @@ class Pipeline:
                 if ee_f is not None and ee_f > 0:
                     apF_corr = float(ee_f)
             if apF_corr is None:
+                # Template-path fallback: no stamp-edge extrapolation (same scope
+                # cut as apB_corr above; deferred to Stage 4).
                 apF_corr = self._aperture_sum_on_template(orig_t, r_orig_pix)
             ap_f_corr = template_norm_i * apF_corr if apF_corr > 0 else 0.0  # high-res template flux in aperture
 

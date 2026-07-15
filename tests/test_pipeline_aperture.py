@@ -348,6 +348,119 @@ def test_apcor_from_psf_bookkeeping_uses_template_not_psf():
     assert cat["totcor1_1"][0] == pytest.approx(1.0 / ee_band)
 
 
+def test_apcor_from_psf_containment_true_normalizes_totcor1():
+    """PSFRegionMap band PSF with containment=0.9: the stamp-normalized EE must be
+    true-total normalized by multiplying by containment (docs/aperture_corrections.md
+    Sec 4.1/5.2), so totcor1 = 1/(EE_stamp * containment). Real-flux bookkeeping
+    (ap_model) is untouched -- containment enters ONLY the correction side."""
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.fit import FitConfig
+    from mophongo.psf_map import PSFRegionMap
+    import mophongo.utils as utils
+
+    n, tn, fl = 25, 25.0, 1.0
+    c = n // 2
+    prof = _gauss(n, 2.5)
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
+    orig.snr_seg = 1.0
+    orig.apcor_from_psf = True                      # force the PSF branch
+    psf444 = _gauss(21, 2.0)
+    psf_band = _gauss(21, 3.5)
+
+    # Single region covering any (ra, dec) the test template resolves to
+    # (orig.wcs is None, so ra_dec == input_position_cutout, a pixel position).
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+
+    def _run(containment):
+        prm_band = PSFRegionMap(regions=regions.copy(), psfs=np.array([psf_band]),
+                                 containment=containment)
+        pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
+        pl.psfs = [psf444, prm_band]                 # band PSF via PSFRegionMap
+        cat = Table({"id": [1]})
+        pl._add_aperture_photometry(
+            cat, [conv], np.array([fl]), np.zeros((n, n)), 1,
+            r_orig_pix=5.0, orig_templates=[orig],
+        )
+        return pl, cat
+
+    pl90, cat90 = _run(0.9)
+    _pl100, cat100 = _run(1.0)
+
+    r_img = pl90._resolve_image_ap_radius_pix(1, pl90.config)
+    ee_band = utils.psf_ee_at_radius(psf_band, r_img)
+    assert cat90["totcor1_1"][0] == pytest.approx(1.0 / (ee_band * 0.9))
+    # Bookkeeping is bit-identical regardless of containment.
+    assert cat90["ap_model_1"][0] == cat100["ap_model_1"][0]
+
+
+def test_psf_ee_cache_keys_on_region_not_psf_id():
+    """Regression: the _psf_ee cache must key on (psfmap, region), not id(psf).
+    PSFRegionMap.get_psf returns a fresh ndarray view per call and CPython
+    reuses freed ids, so an id(psf)-keyed cache collides across regions and
+    some sources silently get another region's EE (pre-existing since Phase A).
+    20 sources in 20 regions with distinct band-PSF widths: every totcor1 must
+    match the direct curve-of-growth computation for its OWN region."""
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from astropy.wcs import WCS
+    from mophongo.fit import FitConfig
+    from mophongo.psf_map import PSFRegionMap
+    import mophongo.utils as utils
+
+    n_src, n, tn = 20, 25, 25.0
+    W = n_src * 30
+    img = np.zeros((n, W))
+    blob = _gauss(n, 2.5)
+    xs = [i * 30 + 12 for i in range(n_src)]
+    for x in xs:
+        img[:, x - 12:x + 13] += blob
+
+    # Full-image WCS: Cutout2D adjusts it per template, so each source's
+    # ra_dec (used for the region lookup) reflects its true image position.
+    w = WCS(naxis=2)
+    w.wcs.crpix = [1.0, 1.0]
+    w.wcs.crval = [150.0, 2.0]
+    w.wcs.cdelt = [-0.04 / 3600.0, 0.04 / 3600.0]
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+
+    convs, origs = [], []
+    for i, x in enumerate(xs):
+        conv = Template(img, (x, 12), (n, n), label=i + 1, wcs=w); conv.template_norm = tn
+        orig = Template(img, (x, 12), (n, n), label=i + 1, wcs=w); orig.template_norm = tn
+        orig.snr_seg = 1.0
+        orig.apcor_from_psf = True                  # force the PSF branch
+        convs.append(conv); origs.append(orig)
+
+    # One region per source (small sky box around it), each with a band PSF of
+    # a distinct width so a cross-region cache hit is detectable.
+    half = 15 * 0.04 / 3600.0  # half the 30 px source spacing, in deg
+    boxes, band_psfs = [], []
+    for i, x in enumerate(xs):
+        ra, dec = w.wcs_pix2world(x, 12, 0)
+        boxes.append(sgeom.box(float(ra) - half, float(dec) - half,
+                               float(ra) + half, float(dec) + half))
+        band_psfs.append(_gauss(21, 1.5 + 0.15 * i))
+    regions = gpd.GeoDataFrame({"psf_key": list(range(n_src))}, geometry=boxes, crs=None)
+    prm_band = PSFRegionMap(regions=regions, psfs=np.stack(band_psfs))
+
+    psf444 = _gauss(21, 2.0)
+    pl = Pipeline([np.zeros((n, W))], np.zeros((n, W)), config=FitConfig())
+    pl.psfs = [psf444, prm_band]
+    cat = Table({"id": list(range(1, n_src + 1))})
+    pl._add_aperture_photometry(cat, convs, np.ones(n_src), np.zeros((n, W)), 1,
+                                r_orig_pix=5.0, orig_templates=origs)
+
+    r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
+    for i in range(n_src):
+        assert cat["totcor1_1"][i] == pytest.approx(
+            1.0 / utils.psf_ee_at_radius(band_psfs[i], r_img)
+        ), f"source {i}: cached EE came from another region's PSF"
+
+
 def test_residual_segmap_sum_same_res():
     """k=1: sum residual only over (segmap == source_id), ignore flux outside."""
     segmap = np.zeros((10, 10), dtype=int)

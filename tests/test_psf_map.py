@@ -1,6 +1,9 @@
+import logging
+
 import pytest
 
 import numpy as np
+import geopandas as gpd
 import shapely.geometry as sgeom
 import matplotlib.pyplot as plt
 from shapely.affinity import translate
@@ -73,6 +76,70 @@ def test_pa_coarsening():
     key_c = regmap.lookup_key(0.5, 1.6)
     assert key_a == key_b
     assert key_c != key_a
+
+
+def _two_region_map(containment=1.0):
+    """Direct (non-from_footprints) construction: two adjacent unit boxes,
+    psf_key 0/1, each with its own 3x3 PSF stamp."""
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0, 1]},
+        geometry=[sgeom.box(0, 0, 1, 1), sgeom.box(1, 0, 2, 1)],
+        crs=None,
+    )
+    psfs = np.stack([np.full((3, 3), 1.0), np.full((3, 3), 2.0)])
+    return PSFRegionMap(regions=regions, psfs=psfs, containment=containment)
+
+
+def test_containment_roundtrip(tmp_path):
+    """containment survives to_file -> from_geojson, per region (psf_key)."""
+    prm = _two_region_map(containment=np.array([0.9, 0.95]))
+    out = tmp_path / "containment_test.geojson"
+    prm.to_file(str(out))
+
+    prm2 = PSFRegionMap.from_geojson(str(out))
+    assert prm2.containment == pytest.approx([0.9, 0.95])
+    assert prm2.get_containment(0.5, 0.5) == pytest.approx(0.9)   # region 0
+    assert prm2.get_containment(1.5, 0.5) == pytest.approx(0.95)  # region 1
+
+
+def test_containment_missing_column_defaults_to_one(tmp_path, caplog):
+    """A geojson saved without the containment column (pre-Stage-2 file) must
+    default containment to 1.0 and emit a loud warning."""
+    prm = _two_region_map()
+    out = tmp_path / "no_containment_test.geojson"
+    # Bypass to_file's containment column (simulate an old cached geojson/fits).
+    prm.regions.to_file(str(out), driver="GeoJSON")
+    from astropy.io import fits
+    fits.writeto(str(out).replace(".geojson", ".fits"), prm.psfs, overwrite=True)
+
+    with caplog.at_level(logging.WARNING):
+        prm2 = PSFRegionMap.from_geojson(str(out))
+
+    assert prm2.containment == pytest.approx(1.0)
+    assert prm2.get_containment(0.5, 0.5) == pytest.approx(1.0)
+    assert any("containment" in rec.message for rec in caplog.records)
+
+
+def test_psf_stamp_containment_disk_fraction():
+    """Sanity check against the analytic disk-in-Gaussian fraction: for an
+    isotropic 2-D Gaussian, the flux in a centred disk of radius r is
+    1 - exp(-r^2 / 2 sigma^2) (containment is the stamp's INSCRIBED-disk
+    fraction, since drizzled stamps are circularly apodized)."""
+    from mophongo.utils import psf_stamp_containment
+
+    sigma_pix = 20.0
+    n = 401
+    c = (n - 1) / 2.0
+    y, x = np.mgrid[0:n, 0:n]
+    psf = np.exp(-((x - c) ** 2 + (y - c) ** 2) / (2 * sigma_pix ** 2))
+
+    pscale = 0.05  # arcsec/pixel
+    radius_pix = 40.0
+    width_arcsec = 2 * radius_pix * pscale
+
+    frac = psf_stamp_containment(psf, pscale, width_arcsec)
+    expected = 1.0 - np.exp(-radius_pix ** 2 / (2 * sigma_pix ** 2))
+    assert frac == pytest.approx(expected, abs=0.01)
 
 
 @pytest.mark.skipif(1, reason="uses external data")
