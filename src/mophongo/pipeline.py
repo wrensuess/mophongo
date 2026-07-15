@@ -465,7 +465,7 @@ class Pipeline:
         from ``fullmap[tmpl.slices_original]`` (e.g. the F444W residual) instead
         of the template's own data. Aperture-sum linearity then gives, for the
         neighbour-subtracted F444W flux of this source,
-        ``aper(residual + model_i) = aper(residual) + template_norm * ap_F_frac``.
+        ``aper(residual + model_i) = aper(residual) + template_norm * apF_book``.
         """
         xc = tmpl.input_position_cutout[0] - tmpl.slices_cutout[1].start
         yc = tmpl.input_position_cutout[1] - tmpl.slices_cutout[0].start
@@ -643,15 +643,22 @@ class Pipeline:
     ) -> None:
         """Compute per-source aperture corrections (Estimator 3).
 
+        Invariant: real-flux bookkeeping (``ap_model``, ``ap_flux``, ``ap_f_data``)
+        always uses the fitted template's own aperture fraction, since ``fl`` and
+        ``template_norm`` are defined against that unit-sum template; PSF curve-
+        of-growth fractions (for ``apcor_from_psf`` sources) enter ONLY the
+        correction factors ``apcor1``/``totcor1``.
+
         Templates are unit-sum normalised; ``orig_t.template_norm`` holds the
         pre-normalisation detection-band sum, converting aperture fractions to
         real flux units. All quantities below in real (image) flux units:
 
-        ap_b     = template_norm * aper(H*K, r_phi)  — low-res convolved template aperture flux
-        ap_f     = template_norm * aper(H,   r_phi)  — high-res template aperture flux
-        apcor1   = ap_f / ap_b                       — shape correction (low-res→high-res)
+        ap_b_corr = template_norm * apB_corr         — low-res aperture flux, correction side
+        ap_f_corr = template_norm * apF_corr         — high-res aperture flux, correction side
+        apcor1   = ap_f_corr / ap_b_corr             — shape correction (low-res→high-res)
         ap_f_data = aper(F444W_residual + model_i, r_phi)   — REAL neighbour-subtracted
-                                                    F444W aperture flux (= ap_f + residual-in-aper)
+                                                    F444W aperture flux (= template_norm*apF_book
+                                                    + residual-in-aper)
         tcor_H   = ftot / ap_f_data   (if a catalog total is supplied, else 1.0)
                                                     — correction to the catalog total
           The tcor_H denominator is the neighbour-subtracted F444W aperture flux
@@ -667,10 +674,9 @@ class Pipeline:
         ap_flux_corr = ap_model * apcor1 * tcor_H + res_sum   (Estimator 3 total)
 
         apcor1 and tcor_H are kept as separate factors and columns and are never
-        algebraically collapsed (their product is ftot/ap_b only when a catalog
-        total is given, else ap_f/ap_b). Per parent id, ap_model is accumulated
-        over any multi-component templates; the corrections and residual are
-        computed once.
+        algebraically collapsed. Per parent id, ap_model is accumulated over any
+        multi-component templates; the corrections and residual are computed
+        once.
 
         Writes ap_model_{idx}, apcor1_{idx}, tcor_{idx}, apcor_{idx} (=product),
         res_sum_{idx}, res_seg_{idx}, ap_flux_{idx}, ap_flux_corr_{idx}.
@@ -789,8 +795,7 @@ class Pipeline:
         # Accumulate the model aperture flux per parent id (multi-component
         # templates share an id); the correction factors and the residual are
         # computed once per parent. apcor1 and tcor_H are kept as SEPARATE
-        # factors (and columns) and never algebraically collapsed: their product
-        # is ftot/ap_b only when a catalog total is supplied, else ap_f/ap_b.
+        # factors (and columns) and never algebraically collapsed.
         model_acc: dict[int, float] = defaultdict(float)
         per: dict[int, dict] = {}
 
@@ -807,12 +812,20 @@ class Pipeline:
             if template_norm_i <= 0:
                 continue
 
-            # Convolved (low-res) aperture fraction. For point-source-like
+            # Bookkeeping fraction: ALWAYS the fitted convolved template's own
+            # aperture sum, since fl is defined against that unit-sum template
+            # (real-flux invariant -- docs/aperture_corrections.md Sec 4.2/5.3).
+            apB_book = self._aperture_sum_on_template(tmpl, r_img_pix)
+            if apB_book <= 0:
+                continue
+
+            # Correction-side convolved aperture fraction. For point-source-like
             # (apcor_from_psf) templates use the band PSF curve of growth so the
-            # fraction is over the TRUE total, not the truncated template footprint.
+            # fraction is over the TRUE total, not the truncated template footprint;
+            # this feeds apcor1/totcor1 ONLY, never the bookkeeping above.
             use_psf = bool(getattr(orig_t, "apcor_from_psf", False))
             ra_dec = None
-            ap_B_frac = None
+            apB_corr = apB_book
             if use_psf:
                 # Cutout-frame position with the cutout-adjusted WCS (the CRPIX is
                 # shifted to the cutout in Template.__init__; see the downsample
@@ -828,13 +841,9 @@ class Pipeline:
                 ee_b = _psf_ee(psf_band, ra_dec[0], ra_dec[1], r_band_pix)
                 ee_f = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix)
                 if (ee_b is not None and ee_b > 0) and (ee_f is not None and ee_f > 0):
-                    ap_B_frac = float(ee_b)
+                    apB_corr = float(ee_b)
                 else:
                     use_psf = False  # PSF unavailable -> template path for this source
-            if ap_B_frac is None:
-                ap_B_frac = self._aperture_sum_on_template(tmpl, r_img_pix)
-            if ap_B_frac <= 0:
-                continue
 
             # Model flux inside the aperture (low-res grid), summed over any
             # multi-component templates that share this parent id.
@@ -845,7 +854,7 @@ class Pipeline:
             # components the secondary has no well-defined native-F444W shape, so
             # its aperture correction uses the primary's apF/apB ratio -> a small
             # bias on the (usually small) secondary flux. TODO: per-component apF.
-            model_acc[row] += fl * ap_B_frac
+            model_acc[row] += fl * apB_book
 
             if row in per:
                 continue  # once-per-parent quantities already computed
@@ -853,34 +862,40 @@ class Pipeline:
             # --- once-per-parent correction factors and residual ---
             # Real-unit template aperture fluxes (template_norm restores image
             # flux units; it cancels in apcor1 but is required so tcor_H is
-            # dimensionless).
-            ap_b = template_norm_i * ap_B_frac  # low-res convolved template flux in aperture
-            # High-res aperture fraction: PSF curve of growth for apcor_from_psf
-            # sources (same true-total normalisation as ap_B_frac above), else the
-            # template. Both from the same source so apcor1 is a clean bounded ratio.
-            ap_F_frac = None
+            # dimensionless). Correction side (apB_corr): PSF EE for
+            # apcor_from_psf sources, else the template -- feeds apcor1/totcor1.
+            ap_b_corr = template_norm_i * apB_corr  # low-res convolved template flux in aperture
+
+            # High-res aperture fraction, correction side: PSF curve of growth for
+            # apcor_from_psf sources (same true-total normalisation as apB_corr
+            # above), else the template. Both from the same source so apcor1 is a
+            # clean bounded ratio. Feeds apcor1 and the low-SNR blend prediction only.
+            apF_corr = None
             if use_psf and ra_dec is not None:
                 ee_f = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix)
                 if ee_f is not None and ee_f > 0:
-                    ap_F_frac = float(ee_f)
-            if ap_F_frac is None:
-                ap_F_frac = self._aperture_sum_on_template(orig_t, r_orig_pix)
-            ap_f = template_norm_i * ap_F_frac if ap_F_frac > 0 else 0.0  # high-res template flux in aperture
+                    apF_corr = float(ee_f)
+            if apF_corr is None:
+                apF_corr = self._aperture_sum_on_template(orig_t, r_orig_pix)
+            ap_f_corr = template_norm_i * apF_corr if apF_corr > 0 else 0.0  # high-res template flux in aperture
 
             # Shape correction: high-res / low-res aperture flux (real units).
             # Uses the template shapes (a clean, bounded ratio ~PSF curve of growth).
-            apcor1 = ap_f / ap_b if (ap_b > 0 and ap_f > 0) else 1.0
+            apcor1 = ap_f_corr / ap_b_corr if (ap_b_corr > 0 and ap_f_corr > 0) else 1.0
             # Internal aperture-to-total (design-doc Eq. 7; = IDL totcor). Bounded
             # ~1.2 for apcor_from_psf sources now that apB is over the true total.
-            totcor1 = 1.0 / ap_B_frac if ap_B_frac > 0 else 1.0
+            totcor1 = 1.0 / apB_corr if apB_corr > 0 else 1.0
 
             # tcor_H denominator: the REAL neighbour-subtracted F444W aperture flux
             # (template model_i + residual), measured on data rather than the
-            # noise-level template sum. By linearity this is ap_f (template) plus
-            # the F444W residual summed in the same aperture.
-            ap_f_data = ap_f
+            # noise-level template sum. Bookkeeping side -- ALWAYS the fitted
+            # original template's own fraction, so aperture-sum linearity holds
+            # against the F444W residual map (built from the same templates).
+            apF_book = self._aperture_sum_on_template(orig_t, r_orig_pix)
+            ap_f_book = template_norm_i * apF_book if apF_book > 0 else 0.0
+            ap_f_data = ap_f_book
             if f444w_res is not None:
-                ap_f_data = ap_f + self._aperture_sum_on_map(f444w_res, orig_t, r_orig_pix)
+                ap_f_data = ap_f_book + self._aperture_sum_on_map(f444w_res, orig_t, r_orig_pix)
 
             # Low-SNR blend of the tcor_H DENOMINATOR (design-doc Eq. 8). The measured
             # neighbour-subtracted F444W aperture flux ap_f_data is noise-dominated for
@@ -907,10 +922,10 @@ class Pipeline:
                         apF_frac_color = self._aperture_sum_on_template(orig_t, r_color)
                     if apF_frac_color and apF_frac_color > 0:
                         color_flux = float(ftot) / nircam_totcor_by_id[sid]
-                        pred = color_flux * (ap_F_frac / apF_frac_color)
+                        pred = color_flux * (apF_corr / apF_frac_color)
                 else:
                     # Rung 2: assume template total = catalog total.
-                    pred = float(ftot) * ap_F_frac
+                    pred = float(ftot) * apF_corr
                 if pred is not None and np.isfinite(pred):
                     aper_pred = float(pred)
                     tcor_w = self._tcor_blend_weight(

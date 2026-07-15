@@ -307,6 +307,47 @@ def test_apcor_from_psf_uses_psf_curve_of_growth():
     )
 
 
+def test_apcor_from_psf_bookkeeping_uses_template_not_psf():
+    """Real-flux bookkeeping (ap_model, ap_flux) must use the fitted template's own
+    aperture fraction, NOT the PSF curve of growth, even for apcor_from_psf sources --
+    regression for the Phase-A bug (docs/aperture_corrections.md Sec 4.2/5.3) that
+    multiplied ap_model by the PSF/template EE ratio. totcor1/apcor1 keep the switched
+    (PSF) behaviour, since those are correction factors, not bookkeeping."""
+    from mophongo.fit import FitConfig
+    import mophongo.utils as utils
+    n, tn, fl = 25, 25.0, 3.0
+    c = n // 2
+    prof = _gauss(n, 2.5)                       # template profile
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
+    orig.snr_seg = 1.0
+    orig.apcor_from_psf = True                  # force the PSF branch for corrections
+    psf444 = _gauss(21, 2.0)
+    psf_band = _gauss(21, 3.5)                  # broader than the template -> EE differs measurably
+    pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
+    pl.psfs = [psf444, psf_band]                # ndarray PSFs -> _psf_ee ignores ra/dec
+    cat = Table({"id": [1]})
+    residual = np.zeros((n, n))
+
+    pl._add_aperture_photometry(
+        cat, [conv], np.array([fl]), residual, 1,
+        r_orig_pix=5.0, orig_templates=[orig],
+    )
+
+    r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
+    apB_template = pl._aperture_sum_on_template(conv, r_img)
+    ee_band = utils.psf_ee_at_radius(psf_band, r_img)
+    assert apB_template != pytest.approx(ee_band)  # PSF EE differs measurably from the template fraction
+
+    # Bookkeeping: ap_model/ap_flux use the template's own fraction, NOT the PSF value.
+    assert cat["ap_model_1"][0] == pytest.approx(fl * apB_template)
+    assert cat["ap_model_1"][0] != pytest.approx(fl * ee_band)
+    assert cat["ap_flux_1"][0] == pytest.approx(cat["ap_model_1"][0] + cat["res_sum_1"][0])
+
+    # Correction factors: totcor1 keeps the PSF curve-of-growth (switched) behaviour.
+    assert cat["totcor1_1"][0] == pytest.approx(1.0 / ee_band)
+
+
 def test_residual_segmap_sum_same_res():
     """k=1: sum residual only over (segmap == source_id), ignore flux outside."""
     segmap = np.zeros((10, 10), dtype=int)
