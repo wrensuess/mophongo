@@ -92,6 +92,14 @@ class FitConfig:
     aperture_catalog: float | str | None = None  # catalog aperture (diameter or table column name)
     aperture_units: str = "arcsec"  # "arcsec" or "pix"
     f444w_col: str | None = None  # catalog column for F444W total flux (enables Yoshi Mode B correction)
+    # Catalog columns for the noise-free low-SNR tcor_H denominator (Weaver+ super
+    # catalog): f444w_totcor_col = the aperture(color)->total factor (e.g. "tot_cor"),
+    # f444w_aper_col = the color-aperture DIAMETER in arcsec (e.g. "use_aper"). When
+    # both are present the faint tcor_H denominator is predicted from the catalog
+    # color-aperture flux (f_f444w/tot_cor) grown to the band aperture by the source's
+    # own curve of growth; otherwise it falls back (see _add_aperture_photometry).
+    f444w_totcor_col: str | None = None
+    f444w_aper_col: str | None = None
 
     # Template extension beyond the segmap (Estimator-3). Each source's composite
     # template H is extended beyond the segmentation isophote so the aperture
@@ -115,15 +123,12 @@ class FitConfig:
     # of real data (compact -> PSF wings; extended -> real data).
     wings_snr_psf: float = 3.0
     extend_template_ee: float = 0.95  # encircled-energy fraction: PSF-wing reach & max template-size cap
-    # --- low-SNR tcor_H: template-growth-blended aperture-to-total denominator ---
+    # --- low-SNR tcor_H: catalog-anchored aperture-to-total denominator ---
     # For faint sources aper_F444W(Rphi) is a noise-dominated raw sum over ~707 px; the
-    # tcor_H denominator is instead blended toward a small high-SNR aperture scaled to Rphi
-    # by the source's own template curve of growth. See Pipeline._add_aperture_photometry.
-    # TODO: these three are sweep knobs for validation. Once good values are found, hard-set
-    # the blend center/width (and likely the anchor) in code and drop them from user config --
-    # some choices here are simply wrong and should not stay open user controls.
-    tcor_lowsnr_psf: bool = False  # master switch; False => tcor_H is bit-for-bit the current value
-    tcor_anchor_ee: float = 0.70  # EE fraction of the representative PSF defining r_small
+    # tcor_H denominator is instead blended toward Fap_pred = (f_f444w/tot_cor) * curve of
+    # growth from the catalog color aperture out to Rphi (noise-free). See
+    # Pipeline._add_aperture_photometry and f444w_totcor_col/f444w_aper_col above.
+    tcor_lowsnr_psf: bool = False  # master switch; False => tcor_H is bit-for-bit the measured value
     tcor_blend_center: float = 1.5  # logistic center = tcor_blend_center * fit_snrlo_psf (in snr_seg)
     tcor_blend_width: float = 0.30  # logistic width as a fraction of the center
     # --- deprecated PSF-wing extension flags (broken in-place implementation; do not use) ---

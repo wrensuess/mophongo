@@ -26,6 +26,7 @@ from photutils.segmentation import SegmentationImage
 from astropy.wcs.utils import proj_plane_pixel_scales
 
 from .psf_map import PSFRegionMap
+from . import utils
 from .utils import bin_factor_from_wcs, downsample_psf, bin_remap
 from .templates import Templates, Template, _slices_from_bbox
 from .fit import FitConfig as _FitConfig
@@ -683,23 +684,28 @@ class Pipeline:
             pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
             r_orig_pix = r_img_pix * pscale_img / pscale_ref if (pscale_img and pscale_ref) else r_img_pix
 
-        # Low-SNR tcor_H: anchor radius r_small = where the representative detection PSF
-        # (F444W-grid sampled, same units as r_orig_pix) reaches tcor_anchor_ee of its
-        # flux. One scalar per band; the growth to Rphi is the source's OWN template
-        # curve (per source, below). r_small_pix=None disables the blend (-> current path).
-        r_small_pix = None
-        if cfg.tcor_lowsnr_psf and getattr(self, "detection_psf", None) is not None:
-            from . import utils
-            try:
-                r_small_pix = float(utils.psf_ee_radius_pix(self.detection_psf, cfg.tcor_anchor_ee))
-                if not (0.0 < r_small_pix < float(r_orig_pix)):
-                    logger.warning(
-                        "tcor low-SNR blend disabled (image %d): r_small=%.3f not in (0, r_phi=%.3f) px",
-                        idx, r_small_pix, float(r_orig_pix))
-                    r_small_pix = None
-            except Exception as exc:  # pragma: no cover - degrade to current path
-                logger.warning("tcor low-SNR blend disabled (image %d): PSF EE radius failed: %s", idx, exc)
-                r_small_pix = None
+        # Catalog-anchored low-SNR tcor_H denominator (Weaver+ super catalog). When
+        # f444w_totcor_col + f444w_aper_col are present, the faint F444W aperture flux
+        # is predicted from the catalog color-aperture flux (f_f444w/tot_cor) grown to
+        # the band aperture by the source's own curve of growth -- noise-free (Rung 1).
+        # r_color = use_aper/2 on the F444W (reference) grid, same units as r_orig_pix.
+        nircam_totcor_by_id: dict[int, float] = {}
+        r_color_pix_by_id: dict[int, float] = {}
+        cat_src = getattr(self, "catalog", None)
+        pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
+        if (cfg.tcor_lowsnr_psf and cat_src is not None and pscale_ref
+                and cfg.f444w_totcor_col and cfg.f444w_aper_col
+                and cfg.f444w_totcor_col in cat_src.colnames
+                and cfg.f444w_aper_col in cat_src.colnames):
+            ids = np.asarray(cat_src["id"]).astype(int)
+            tcs = np.asarray(cat_src[cfg.f444w_totcor_col], dtype=float)
+            uas = np.asarray(cat_src[cfg.f444w_aper_col], dtype=float)
+            for sid, tc, ua in zip(ids, tcs, uas):
+                if np.isfinite(tc) and tc > 0 and np.isfinite(ua) and ua > 0:
+                    nircam_totcor_by_id[int(sid)] = float(tc)
+                    r_color_pix_by_id[int(sid)] = 0.5 * float(ua) / pscale_ref
+            print(f"  Low-SNR tcor_H: catalog-anchored denominator from "
+                  f"'{cfg.f444w_totcor_col}'/'{cfg.f444w_aper_col}' ({len(nircam_totcor_by_id)} sources)")
 
         for name in (
             f"ap_model_{idx}",
@@ -710,7 +716,7 @@ class Pipeline:
             f"apf_data_{idx}",
             f"aper_rphi_{idx}",
             f"tcor_w_{idx}",
-            f"aper_small_{idx}",
+            f"aper_pred_{idx}",
             f"res_sum_{idx}",
             f"res_seg_{idx}",
             f"ap_flux_{idx}",
@@ -755,6 +761,16 @@ class Pipeline:
         psf_hires = self.psfs[0] if (self.psfs is not None and len(self.psfs) > 0) else None
         psf_band = self.psfs[idx] if (self.psfs is not None and len(self.psfs) > idx) else None
         _ee_cache: dict = {}
+
+        # Aperture radius for the BAND PSF EE (apB), in the band PSF's NATIVE pixel
+        # scale. psf_hires is on the reference grid so apF uses r_orig_pix directly,
+        # but psf_band is on its native grid; in upsample mode the fit grid (r_img_pix)
+        # is finer than the band PSF, so measuring apB at r_img_pix would sample the
+        # wrong physical radius (-> totcor1 collapses to ~1). Convert via native scales.
+        r_band_pix = r_img_pix
+        _psn = getattr(self, "_native_pscale", None)
+        if _psn and len(_psn) > idx and _psn[0] and _psn[idx]:
+            r_band_pix = r_orig_pix * float(_psn[0]) / float(_psn[idx])
 
         def _psf_ee(psfmap, ra, dec, radius):
             if psfmap is None:
@@ -809,7 +825,7 @@ class Pipeline:
                     ra_dec = pos
                 # Both fractions must come from the PSF, or neither: a mixed
                 # template/PSF apcor1 would not be a clean curve-of-growth ratio.
-                ee_b = _psf_ee(psf_band, ra_dec[0], ra_dec[1], r_img_pix)
+                ee_b = _psf_ee(psf_band, ra_dec[0], ra_dec[1], r_band_pix)
                 ee_f = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix)
                 if (ee_b is not None and ee_b > 0) and (ee_f is not None and ee_f > 0):
                     ap_B_frac = float(ee_b)
@@ -866,40 +882,53 @@ class Pipeline:
             if f444w_res is not None:
                 ap_f_data = ap_f + self._aperture_sum_on_map(f444w_res, orig_t, r_orig_pix)
 
-            # Low-SNR blend: the full-Rphi measurement ap_f_data is noise-dominated for
-            # faint sources (~707 px of sky). Blend it smoothly toward est_growth = the
-            # deblended flux in a small high-SNR aperture (r_small) scaled to Rphi by the
-            # source's OWN template curve of growth. Both estimate the same quantity
-            # (deblended F444W flux in Rphi), so the convex blend is a weighted average.
-            # w -> 1 (high snr_seg) reproduces ap_f_data exactly; w -> 0 uses est_growth.
+            # Low-SNR blend of the tcor_H DENOMINATOR (design-doc Eq. 8). The measured
+            # neighbour-subtracted F444W aperture flux ap_f_data is noise-dominated for
+            # faint sources (~707 px of sky); blend it toward a NOISE-FREE catalog-anchored
+            # prediction. Rung 1 (both catalog columns): Fap_pred = color_flux *
+            # apF_frac(Rphi)/apF_frac(r_color), color_flux = f_f444w/tot_cor. Rung 2 (only
+            # a catalog total): Fap_pred = f_f444w * apF_frac(Rphi) => tcor_H -> 1/apF_frac.
+            # apF_frac uses the SAME source profile (PSF for apcor_from_psf, else template).
+            # w -> 1 (high snr_seg) keeps ap_f_data; w -> 0 uses the prediction.
+            ftot = f444w_totals.get(int(tmpl.id)) if use_tcor else None
+            has_ftot = ftot is not None and np.isfinite(ftot)
+
             aper_rphi = ap_f_data
             tcor_w = 1.0
-            aper_small = float(cfg.bad_value)
-            if r_small_pix is not None and f444w_res is not None and not use_psf:
-                tcor_w = self._tcor_blend_weight(
-                    getattr(orig_t, "snr_seg", float("nan")),
-                    cfg.tcor_blend_center * cfg.fit_snrlo_psf,
-                    cfg.tcor_blend_width,
-                )
-                if tcor_w < 1.0:
-                    apF_frac_s = self._aperture_sum_on_template(orig_t, r_small_pix)
-                    if apF_frac_s > 0:
-                        aper_small = (template_norm_i * apF_frac_s
-                                      + self._aperture_sum_on_map(f444w_res, orig_t, r_small_pix))
-                        est_growth = aper_small * (ap_F_frac / apF_frac_s)
-                        # Never form 0*inf (a FLAG_SUM_ZERO template gives apF_frac_s->0):
-                        # only blend a finite growth estimate, else keep ap_f_data.
-                        if np.isfinite(est_growth):
-                            aper_rphi = tcor_w * ap_f_data + (1.0 - tcor_w) * est_growth
+            aper_pred = float(cfg.bad_value)
+            if cfg.tcor_lowsnr_psf and has_ftot:
+                sid = int(tmpl.id)
+                pred = None
+                if sid in nircam_totcor_by_id:
+                    r_color = r_color_pix_by_id[sid]
+                    if use_psf and ra_dec is not None:
+                        apF_frac_color = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_color)
+                    else:
+                        apF_frac_color = self._aperture_sum_on_template(orig_t, r_color)
+                    if apF_frac_color and apF_frac_color > 0:
+                        color_flux = float(ftot) / nircam_totcor_by_id[sid]
+                        pred = color_flux * (ap_F_frac / apF_frac_color)
+                else:
+                    # Rung 2: assume template total = catalog total.
+                    pred = float(ftot) * ap_F_frac
+                if pred is not None and np.isfinite(pred):
+                    aper_pred = float(pred)
+                    tcor_w = self._tcor_blend_weight(
+                        getattr(orig_t, "snr_seg", float("nan")),
+                        cfg.tcor_blend_center * cfg.fit_snrlo_psf,
+                        cfg.tcor_blend_width,
+                    )
+                    # Clamp the measured term at 0: a negative ap_f_data is unphysical
+                    # over-subtraction, and blending it with the positive prediction can
+                    # cross zero at intermediate w -> tcor_H spike (a residual band tail).
+                    # Both terms are then >= 0 (aper_pred > 0), so aper_rphi cannot cross
+                    # zero. The raw (unclamped) value stays in the apf_data_{idx} diagnostic.
+                    aper_rphi = tcor_w * max(ap_f_data, 0.0) + (1.0 - tcor_w) * aper_pred
 
-            # tcor_H = f_f444w / aper_rphi (blended). NO guard on the sign/zero of
-            # aper_rphi -- over-subtracted sources yield negative/inf by design
-            # (inspect apf_data_/aper_rphi_/tcor_w_{idx}). Stays 1 without a catalog total.
+            # tcor_H = f_f444w / aper_rphi (blended). Stays 1 without a catalog total.
             tcor_H = 1.0
-            if use_tcor:
-                ftot = f444w_totals.get(int(tmpl.id))
-                if ftot is not None and np.isfinite(ftot):
-                    tcor_H = float(np.float64(ftot) / np.float64(aper_rphi))
+            if has_ftot:
+                tcor_H = float(np.float64(ftot) / np.float64(aper_rphi))
 
             # Residual within the measurement aperture (disk), added UNSCALED.
             # Same aperture geometry as _aperture_sum_on_template applied to the
@@ -926,7 +955,7 @@ class Pipeline:
             res_seg = self._residual_segmap_sum(residual, int(tmpl.id), orig_t, k)
 
             per[row] = dict(apcor1=apcor1, totcor1=totcor1, tcor=tcor_H, apf_data=ap_f_data,
-                            aper_rphi=aper_rphi, tcor_w=tcor_w, aper_small=aper_small,
+                            aper_rphi=aper_rphi, tcor_w=tcor_w, aper_pred=aper_pred,
                             res_sum=res_sum, res_seg=res_seg)
 
         # Write per-parent Estimator-3 results. The correction is applied as the
@@ -944,7 +973,7 @@ class Pipeline:
             cat[f"apf_data_{idx}"][row] = d["apf_data"]
             cat[f"aper_rphi_{idx}"][row] = d["aper_rphi"]
             cat[f"tcor_w_{idx}"][row] = d["tcor_w"]
-            cat[f"aper_small_{idx}"][row] = d["aper_small"]
+            cat[f"aper_pred_{idx}"][row] = d["aper_pred"]
             cat[f"apcor_{idx}"][row] = apcor1 * tcor_H
             cat[f"res_sum_{idx}"][row] = res_sum
             cat[f"res_seg_{idx}"][row] = d["res_seg"]
@@ -971,7 +1000,6 @@ class Pipeline:
         from .fit import SparseFitter
         from .astro_fit import GlobalAstroFitter
         from .astrometry import AstroCorrect
-        from . import utils
         import warnings
 
         images = self.images
@@ -1009,6 +1037,15 @@ class Pipeline:
                 cat[config.aperture_catalog] = catalog[config.aperture_catalog]
             if config.f444w_col is not None and config.f444w_col in catalog.colnames:
                 cat[config.f444w_col] = catalog[config.f444w_col]
+
+        # Native per-band pixel scales, captured BEFORE the fit loop's upsample step
+        # overwrites wcs[idx] with wcs[0]. The band PSF (self.psfs[idx]) is stored on
+        # its native grid, so the aperture-correction PSF EE must be measured at the
+        # aperture radius in that native scale, not the (possibly upsampled) fit grid.
+        self._native_pscale = [
+            (self._pixel_scale_arcsec(w) if w is not None else None)
+            for w in (self.wcs if self.wcs is not None else [])
+        ]
 
         # --- Representative detection-PSF growth curve (Estimator-3 plan v5) ---
         # Cache one curve of growth near the mosaic centre so the 50/95/99% EE

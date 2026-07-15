@@ -84,7 +84,7 @@ def test_aperture_photometry_with_tcor():
     assert cat["ap_flux_corr_1"][0] == pytest.approx(fl * f444w_total / template_norm_i)
 
 
-# --- low-SNR template-growth-blended tcor_H denominator -----------------------
+# --- low-SNR catalog-anchored tcor_H denominator -----------------------------
 
 def _gauss(n, sigma):
     c = (n - 1) / 2.0
@@ -93,9 +93,25 @@ def _gauss(n, sigma):
     return p / p.sum()
 
 
-def _lowsnr_setup(snr_seg=1.0, enable=True, with_psf=True, template_norm=25.0):
-    """Pipeline whose F444W image == the source's own model (residual=0), so the
-    growth estimator is EXACT: est_growth == ap_f_data for any blend weight."""
+def _simple_wcs(pscale_arcsec=0.04, n=25):
+    from astropy.wcs import WCS
+    w = WCS(naxis=2)
+    w.wcs.crpix = [n / 2.0, n / 2.0]
+    w.wcs.crval = [150.0, 2.0]
+    w.wcs.cdelt = [-pscale_arcsec / 3600.0, pscale_arcsec / 3600.0]
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    return w
+
+
+def _lowsnr_setup(snr_seg=1.0, enable=True, template_norm=25.0, ftot=42.0,
+                  catalog_cols=False, tot_cor=3.0, use_aper=0.2):
+    """Pipeline whose F444W image == the source's own model (residual=0), so
+    ap_f_data == template ap_f == template_norm * ap_F_frac exactly.
+
+    catalog_cols=True attaches tot_cor/use_aper to self.catalog and a WCS,
+    enabling the Rung-1 catalog-anchored prediction; otherwise Rung 2 applies
+    (Fap_pred = ftot * ap_F_frac).
+    """
     from mophongo.fit import FitConfig
     n, tn = 25, template_norm
     c = n // 2
@@ -107,21 +123,25 @@ def _lowsnr_setup(snr_seg=1.0, enable=True, with_psf=True, template_norm=25.0):
     orig.snr_seg = snr_seg
     img = np.zeros((n, n))
     img[orig.slices_original] += orig.data[orig.slices_cutout] * tn
-    cfg = FitConfig(tcor_lowsnr_psf=enable, tcor_anchor_ee=0.70,
-                    tcor_blend_center=1.5, fit_snrlo_psf=10.0)
-    pl = Pipeline([img], np.zeros((n, n)), config=cfg)
+    cfg_kw = dict(tcor_lowsnr_psf=enable, tcor_blend_center=1.5, fit_snrlo_psf=10.0)
+    pl_kw = {}
+    if catalog_cols:
+        cfg_kw.update(f444w_totcor_col="tot_cor", f444w_aper_col="use_aper")
+        pl_kw["catalog"] = Table({"id": [1], "x": [c], "y": [c],
+                                  "tot_cor": [tot_cor], "use_aper": [use_aper]})
+        pl_kw["wcs"] = [_simple_wcs(0.04, n)]
+    pl = Pipeline([img], np.zeros((n, n)), config=FitConfig(**cfg_kw), **pl_kw)
     pl.psfs = [np.ones((5, 5))]
-    pl.detection_psf = _gauss(15, 1.5) if with_psf else None
     cat = Table({"id": [1]})
     pl._add_aperture_photometry(
         cat, [conv], np.array([2.0]), np.zeros((n, n)), 1,
-        r_orig_pix=5.0, orig_templates=[orig], f444w_totals={1: 42.0},
+        r_orig_pix=5.0, orig_templates=[orig], f444w_totals={1: ftot},
     )
     return cat
 
 
 def test_tcor_lowsnr_disabled_by_default():
-    """Default FitConfig (tcor_lowsnr_psf=False): blend inactive, w=1, denom unchanged."""
+    """tcor_lowsnr_psf=False: blend inactive, w=1, denom == measured ap_f_data."""
     cat = _lowsnr_setup(snr_seg=1.0, enable=False)
     assert cat["tcor_w_1"][0] == pytest.approx(1.0)
     assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
@@ -135,17 +155,6 @@ def test_tcor_lowsnr_high_snr_identity():
     assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
 
 
-def test_tcor_lowsnr_blend_exact_when_data_follows_template():
-    """Low snr_seg -> blend active (w<1), but with residual=0 the growth estimate is
-    EXACT (est_growth == ap_f_data), so the blended denominator is unchanged."""
-    cat = _lowsnr_setup(snr_seg=1.0, enable=True)
-    assert cat["tcor_w_1"][0] < 1.0                       # blend is active
-    assert np.isfinite(cat["aper_small_1"][0]) and cat["aper_small_1"][0] > 0
-    # est_growth == ap_f_data exactly -> aper_rphi unchanged regardless of weight
-    assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
-    assert cat["tcor_1"][0] == pytest.approx(42.0 / cat["apf_data_1"][0])
-
-
 def test_tcor_lowsnr_nan_snr_no_op():
     """NaN snr_seg (non-extended template) -> w=1 even when enabled."""
     cat = _lowsnr_setup(snr_seg=float("nan"), enable=True)
@@ -153,11 +162,149 @@ def test_tcor_lowsnr_nan_snr_no_op():
     assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
 
 
-def test_tcor_lowsnr_no_psf_no_op():
-    """Enabled but no detection PSF -> r_small unavailable -> blend no-ops to direct."""
-    cat = _lowsnr_setup(snr_seg=1.0, enable=True, with_psf=False)
-    assert cat["tcor_w_1"][0] == pytest.approx(1.0)
-    assert cat["aper_rphi_1"][0] == pytest.approx(cat["apf_data_1"][0])
+def test_tcor_lowsnr_rung2_predicts_from_total():
+    """No catalog columns -> Rung 2: Fap_pred = ftot * ap_F_frac. With residual=0,
+    ap_F_frac = ap_f_data / template_norm, so aper_pred = ftot * ap_f_data / tn, and
+    the blended denom / tcor_H follow the convex-blend identity exactly."""
+    tn, ftot = 25.0, 42.0
+    cat = _lowsnr_setup(snr_seg=1.0, enable=True, template_norm=tn, ftot=ftot,
+                        catalog_cols=False)
+    w = cat["tcor_w_1"][0]
+    assert 0.0 < w < 1.0  # blend active at low snr
+    apf_data = cat["apf_data_1"][0]
+    aper_pred = cat["aper_pred_1"][0]
+    assert aper_pred == pytest.approx(ftot * apf_data / tn)
+    assert cat["aper_rphi_1"][0] == pytest.approx(w * apf_data + (1 - w) * aper_pred)
+    assert cat["tcor_1"][0] == pytest.approx(ftot / cat["aper_rphi_1"][0])
+
+
+def test_tcor_lowsnr_rung1_catalog_anchored():
+    """With tot_cor/use_aper: Fap_pred = (ftot/tot_cor) * apF(Rphi)/apF(r_color),
+    a NOISE-FREE positive prediction. Verify it is finite, positive, differs from the
+    Rung-2 value, and drives the blend/tcor_H identity."""
+    tn, ftot, tc = 25.0, 42.0, 3.0
+    cat = _lowsnr_setup(snr_seg=1.0, enable=True, template_norm=tn, ftot=ftot,
+                        catalog_cols=True, tot_cor=tc, use_aper=0.2)
+    w = cat["tcor_w_1"][0]
+    assert 0.0 < w < 1.0
+    aper_pred = cat["aper_pred_1"][0]
+    assert np.isfinite(aper_pred) and aper_pred > 0
+    # growth apF(Rphi)/apF(r_color) > 1, so aper_pred > color_flux = ftot/tot_cor
+    assert aper_pred > ftot / tc
+    assert cat["aper_rphi_1"][0] == pytest.approx(w * cat["apf_data_1"][0] + (1 - w) * aper_pred)
+    assert cat["tcor_1"][0] == pytest.approx(ftot / cat["aper_rphi_1"][0])
+    # Rung 1 (catalog color aperture) differs from Rung 2 (assumes template total).
+    cat2 = _lowsnr_setup(snr_seg=1.0, enable=True, template_norm=tn, ftot=ftot,
+                         catalog_cols=False)
+    assert cat["aper_pred_1"][0] != pytest.approx(cat2["aper_pred_1"][0])
+
+
+def test_tcor_lowsnr_clamps_negative_measurement():
+    """Over-subtracted (negative measured) F444W aperture flux is clamped to 0 in the
+    blend, so the denominator stays positive (no tcor_H spike / residual band tail);
+    the raw negative value is preserved in the apf_data diagnostic."""
+    from mophongo.fit import FitConfig
+    n, tn, ftot = 25, 25.0, 42.0
+    c = n // 2
+    prof = _gauss(n, 2.5)
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
+    orig.snr_seg = 4.0                              # intermediate SNR -> 0 < w < 1
+    img = np.full((n, n), -0.5)                     # negative F444W -> ap_f_data < 0
+    cfg = FitConfig(tcor_lowsnr_psf=True, tcor_blend_center=1.5, fit_snrlo_psf=10.0)
+    pl = Pipeline([img], np.zeros((n, n)), config=cfg)
+    pl.psfs = [np.ones((5, 5))]
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(cat, [conv], np.array([2.0]), np.zeros((n, n)), 1,
+                                r_orig_pix=5.0, orig_templates=[orig], f444w_totals={1: ftot})
+    w = cat["tcor_w_1"][0]
+    assert 0.0 < w < 1.0
+    assert cat["apf_data_1"][0] < 0                 # raw measured value negative (diagnostic kept)
+    aper_pred = cat["aper_pred_1"][0]
+    # clamp: aper_rphi = w*max(apf_data,0) + (1-w)*aper_pred = (1-w)*aper_pred > 0
+    assert cat["aper_rphi_1"][0] == pytest.approx((1 - w) * aper_pred)
+    assert cat["aper_rphi_1"][0] > 0
+    assert cat["tcor_1"][0] > 0                      # no sign flip / spike
+
+
+def test_apcor_from_psf_uses_band_native_pixel_scale():
+    """The band-PSF EE (apB) must be measured at the aperture radius in the BAND
+    PSF's NATIVE pixel scale, not the (possibly upsampled) fit-grid r_img_pix.
+    Regression for the upsample-mode grid mismatch that collapsed totcor1 to ~1."""
+    from mophongo.fit import FitConfig
+    import mophongo.utils as utils
+    n, tn = 25, 25.0; c = n // 2
+    prof = _gauss(n, 2.5)
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
+    orig.snr_seg = 1.0; orig.apcor_from_psf = True
+    psf444 = _gauss(21, 2.0); psf_band = _gauss(21, 3.5)
+    pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
+    pl.psfs = [psf444, psf_band]
+    pl._native_pscale = [0.04, 0.08]           # ref 40 mas, band native 80 mas (upsample x2)
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(cat, [conv], np.array([1.0]), np.zeros((n, n)), 1,
+                                r_orig_pix=15.0, orig_templates=[orig])
+    # apB measured at r_band = r_orig * 0.04/0.08 = 7.5 native px (NOT r_img_pix)
+    assert cat["totcor1_1"][0] == pytest.approx(1.0 / utils.psf_ee_at_radius(psf_band, 7.5))
+
+
+def test_tcor_lowsnr_rung1_psf_branch():
+    """apcor_from_psf source WITH rung-1 columns: apF_frac_color must come from the
+    PSF curve of growth (not the template), so Fap_pred uses EE_psf(Rphi)/EE_psf(r_color)."""
+    from mophongo.fit import FitConfig
+    import mophongo.utils as utils
+    n, tn, ftot, tc, ua = 25, 25.0, 42.0, 3.0, 0.2
+    c = n // 2
+    prof = _gauss(n, 2.5)
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
+    orig.snr_seg = 1.0
+    orig.apcor_from_psf = True                       # force the PSF branch
+    psf444 = _gauss(21, 2.0); psf_band = _gauss(21, 3.5)
+    img = np.zeros((n, n)); img[orig.slices_original] += orig.data[orig.slices_cutout] * tn
+    cfg = FitConfig(tcor_lowsnr_psf=True, tcor_blend_center=1.5, fit_snrlo_psf=10.0,
+                    f444w_totcor_col="tot_cor", f444w_aper_col="use_aper")
+    catalog = Table({"id": [1], "x": [c], "y": [c], "tot_cor": [tc], "use_aper": [ua]})
+    pl = Pipeline([img], np.zeros((n, n)), catalog=catalog,
+                  wcs=[_simple_wcs(0.04, n)], config=cfg)
+    pl.psfs = [psf444, psf_band]                     # ndarray PSFs -> _psf_ee ignores ra/dec
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(cat, [conv], np.array([2.0]), np.zeros((n, n)), 1,
+                                r_orig_pix=5.0, orig_templates=[orig], f444w_totals={1: ftot})
+    r_color = 0.5 * ua / 0.04  # arcsec radius -> F444W px at 0.04"/px
+    expected = (ftot / tc) * (utils.psf_ee_at_radius(psf444, 5.0)
+                              / utils.psf_ee_at_radius(psf444, r_color))
+    assert cat["aper_pred_1"][0] == pytest.approx(expected)
+
+
+def test_apcor_from_psf_uses_psf_curve_of_growth():
+    """apcor_from_psf source: apF/apB come from the PSF curve of growth (utils.
+    psf_ee_at_radius), so totcor1 = 1/EE(PSF_band, r_img). Regression for the
+    module-level utils import used by the PSF path."""
+    from mophongo.fit import FitConfig
+    import mophongo.utils as utils
+    n, tn = 25, 25.0
+    c = n // 2
+    prof = _gauss(n, 2.5)
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
+    orig.snr_seg = 1.0
+    orig.apcor_from_psf = True                      # force the PSF branch
+    psf444 = _gauss(21, 2.0)
+    psf_band = _gauss(21, 3.5)                       # broader band PSF
+    pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
+    pl.psfs = [psf444, psf_band]                     # ndarray PSFs -> _psf_ee ignores ra/dec
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(
+        cat, [conv], np.array([1.0]), np.zeros((n, n)), 1,
+        r_orig_pix=5.0, orig_templates=[orig],
+    )
+    r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
+    assert cat["totcor1_1"][0] == pytest.approx(1.0 / utils.psf_ee_at_radius(psf_band, r_img))
+    assert cat["apcor1_1"][0] == pytest.approx(
+        utils.psf_ee_at_radius(psf444, 5.0) / utils.psf_ee_at_radius(psf_band, r_img)
+    )
 
 
 def test_residual_segmap_sum_same_res():
