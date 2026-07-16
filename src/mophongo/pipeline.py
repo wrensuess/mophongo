@@ -473,23 +473,6 @@ class Pipeline:
         phot = aperture_photometry(fullmap[tmpl.slices_original], aper, method="exact")
         return float(phot["aperture_sum"][0])
 
-    @staticmethod
-    def _tcor_blend_weight(snr_seg: float, center: float, width: float) -> float:
-        """Smooth logistic weight for the low-SNR tcor_H denominator blend.
-
-        w -> 1 at high ``snr_seg`` (trust the direct Rphi measurement ``ap_f_data``),
-        w -> 0 at low ``snr_seg`` (trust the small-aperture + template-growth estimate).
-        NaN ``snr_seg`` (e.g. non-extended templates) returns 1.0 so those sources keep
-        the current direct path. ``center``/``width`` are in ``snr_seg`` units (width is
-        the logistic scale = ``width*center``).
-        """
-        if not np.isfinite(snr_seg):
-            return 1.0
-        scale = max(float(width) * float(center), 1e-6)
-        # clip the logistic argument so np.exp cannot overflow for extreme SNR/params
-        z = np.clip((float(snr_seg) - float(center)) / scale, -700.0, 700.0)
-        return float(1.0 / (1.0 + np.exp(-z)))
-
     def _build_f444w_residual(self, orig_templates: list[Template]) -> np.ndarray:
         """F444W neighbour-subtracted residual map: images[0] - Σ_j model_j.
 
@@ -671,6 +654,8 @@ class Pipeline:
         res_sum      = Σ_aperture(residual)          (residual within the aperture disk)
         res_seg      = Σ_segmap(residual)            (diagnostic only)
         ap_flux      = ap_model + res_sum            (observed aperture flux)
+        ap_flux_est1 = (ap_model + res_sum) * totcor1         (IDL-exact Estimator 1)
+        ap_flux_est2 = ap_model * totcor1 + res_sum           (Estimator 2, residual unscaled)
         ap_flux_corr = ap_model * apcor1 * tcor_H + res_sum   (Estimator 3 total)
 
         apcor1 and tcor_H are kept as separate factors and columns and are never
@@ -678,8 +663,17 @@ class Pipeline:
         multi-component templates; the corrections and residual are computed
         once.
 
-        Writes ap_model_{idx}, apcor1_{idx}, tcor_{idx}, apcor_{idx} (=product),
-        res_sum_{idx}, res_seg_{idx}, ap_flux_{idx}, ap_flux_corr_{idx}.
+        TRANSITIONAL (docs/aperture_corrections.md Sec 3.3/4.4/5.4): ``tcor_H``,
+        ``apcor_``, and ``ap_flux_corr_`` still divide by the *measured*
+        neighbour-subtracted F444W aperture flux (``aper_rphi_`` == ``apf_data_``)
+        — the low-SNR noise issues of Sec 4.4 are known and unresolved. They stay
+        in place only until the Stage-3b two-step catalog tie (``tcor_int`` +
+        ``s_cat``) replaces them. ``est1``/``est2`` (with ``totcor1``/``apcor1``)
+        are the IDL-convention outputs and are not affected by this.
+
+        Writes ap_model_{idx}, apcor1_{idx}, totcor1_{idx}, tcor_{idx},
+        apcor_{idx} (=product), res_sum_{idx}, res_seg_{idx}, ap_flux_{idx},
+        ap_flux_est1_{idx}, ap_flux_est2_{idx}, ap_flux_corr_{idx}.
         """
         cfg = self.config
         id_to_row = {int(i): k for k, i in enumerate(cat["id"])}
@@ -690,29 +684,6 @@ class Pipeline:
             pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
             r_orig_pix = r_img_pix * pscale_img / pscale_ref if (pscale_img and pscale_ref) else r_img_pix
 
-        # Catalog-anchored low-SNR tcor_H denominator (Weaver+ super catalog). When
-        # f444w_totcor_col + f444w_aper_col are present, the faint F444W aperture flux
-        # is predicted from the catalog color-aperture flux (f_f444w/tot_cor) grown to
-        # the band aperture by the source's own curve of growth -- noise-free (Rung 1).
-        # r_color = use_aper/2 on the F444W (reference) grid, same units as r_orig_pix.
-        nircam_totcor_by_id: dict[int, float] = {}
-        r_color_pix_by_id: dict[int, float] = {}
-        cat_src = getattr(self, "catalog", None)
-        pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
-        if (cfg.tcor_lowsnr_psf and cat_src is not None and pscale_ref
-                and cfg.f444w_totcor_col and cfg.f444w_aper_col
-                and cfg.f444w_totcor_col in cat_src.colnames
-                and cfg.f444w_aper_col in cat_src.colnames):
-            ids = np.asarray(cat_src["id"]).astype(int)
-            tcs = np.asarray(cat_src[cfg.f444w_totcor_col], dtype=float)
-            uas = np.asarray(cat_src[cfg.f444w_aper_col], dtype=float)
-            for sid, tc, ua in zip(ids, tcs, uas):
-                if np.isfinite(tc) and tc > 0 and np.isfinite(ua) and ua > 0:
-                    nircam_totcor_by_id[int(sid)] = float(tc)
-                    r_color_pix_by_id[int(sid)] = 0.5 * float(ua) / pscale_ref
-            print(f"  Low-SNR tcor_H: catalog-anchored denominator from "
-                  f"'{cfg.f444w_totcor_col}'/'{cfg.f444w_aper_col}' ({len(nircam_totcor_by_id)} sources)")
-
         for name in (
             f"ap_model_{idx}",
             f"apcor_{idx}",
@@ -721,11 +692,10 @@ class Pipeline:
             f"tcor_{idx}",
             f"apf_data_{idx}",
             f"aper_rphi_{idx}",
-            f"tcor_w_{idx}",
-            f"aper_pred_{idx}",
             f"res_sum_{idx}",
             f"res_seg_{idx}",
             f"ap_flux_{idx}",
+            f"ap_flux_est1_{idx}",
             f"ap_flux_est2_{idx}",
             f"ap_flux_corr_{idx}",
         ):
@@ -920,50 +890,15 @@ class Pipeline:
             if f444w_res is not None:
                 ap_f_data = ap_f_book + self._aperture_sum_on_map(f444w_res, orig_t, r_orig_pix)
 
-            # Low-SNR blend of the tcor_H DENOMINATOR (design-doc Eq. 8). The measured
-            # neighbour-subtracted F444W aperture flux ap_f_data is noise-dominated for
-            # faint sources (~707 px of sky); blend it toward a NOISE-FREE catalog-anchored
-            # prediction. Rung 1 (both catalog columns): Fap_pred = color_flux *
-            # apF_frac(Rphi)/apF_frac(r_color), color_flux = f_f444w/tot_cor. Rung 2 (only
-            # a catalog total): Fap_pred = f_f444w * apF_frac(Rphi) => tcor_H -> 1/apF_frac.
-            # apF_frac uses the SAME source profile (PSF for apcor_from_psf, else template).
-            # w -> 1 (high snr_seg) keeps ap_f_data; w -> 0 uses the prediction.
+            # TRANSITIONAL (docs/aperture_corrections.md Sec 3.3/4.4/5.4): tcor_H is
+            # the plain measured ratio, ftot / ap_f_data -- the low-SNR
+            # catalog-anchored blend (formerly tcor_lowsnr_psf) is removed pending
+            # the Stage-3b two-step tie (tcor_int + s_cat). aper_rphi is kept as a
+            # column equal to the denominator actually used (== ap_f_data).
             ftot = f444w_totals.get(int(tmpl.id)) if use_tcor else None
             has_ftot = ftot is not None and np.isfinite(ftot)
 
             aper_rphi = ap_f_data
-            tcor_w = 1.0
-            aper_pred = float(cfg.bad_value)
-            if cfg.tcor_lowsnr_psf and has_ftot:
-                sid = int(tmpl.id)
-                pred = None
-                if sid in nircam_totcor_by_id:
-                    r_color = r_color_pix_by_id[sid]
-                    if use_psf and ra_dec is not None:
-                        apF_frac_color = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_color)
-                    else:
-                        apF_frac_color = self._aperture_sum_on_template(orig_t, r_color)
-                    if apF_frac_color and apF_frac_color > 0:
-                        color_flux = float(ftot) / nircam_totcor_by_id[sid]
-                        pred = color_flux * (apF_corr / apF_frac_color)
-                else:
-                    # Rung 2: assume template total = catalog total.
-                    pred = float(ftot) * apF_corr
-                if pred is not None and np.isfinite(pred):
-                    aper_pred = float(pred)
-                    tcor_w = self._tcor_blend_weight(
-                        getattr(orig_t, "snr_seg", float("nan")),
-                        cfg.tcor_blend_center * cfg.fit_snrlo_psf,
-                        cfg.tcor_blend_width,
-                    )
-                    # Clamp the measured term at 0: a negative ap_f_data is unphysical
-                    # over-subtraction, and blending it with the positive prediction can
-                    # cross zero at intermediate w -> tcor_H spike (a residual band tail).
-                    # Both terms are then >= 0 (aper_pred > 0), so aper_rphi cannot cross
-                    # zero. The raw (unclamped) value stays in the apf_data_{idx} diagnostic.
-                    aper_rphi = tcor_w * max(ap_f_data, 0.0) + (1.0 - tcor_w) * aper_pred
-
-            # tcor_H = f_f444w / aper_rphi (blended). Stays 1 without a catalog total.
             tcor_H = 1.0
             if has_ftot:
                 tcor_H = float(np.float64(ftot) / np.float64(aper_rphi))
@@ -993,8 +928,7 @@ class Pipeline:
             res_seg = self._residual_segmap_sum(residual, int(tmpl.id), orig_t, k)
 
             per[row] = dict(apcor1=apcor1, totcor1=totcor1, tcor=tcor_H, apf_data=ap_f_data,
-                            aper_rphi=aper_rphi, tcor_w=tcor_w, aper_pred=aper_pred,
-                            res_sum=res_sum, res_seg=res_seg)
+                            aper_rphi=aper_rphi, res_sum=res_sum, res_seg=res_seg)
 
         # Write per-parent Estimator-3 results. The correction is applied as the
         # explicit product apcor1 * tcor_H (never pre-collapsed).
@@ -1010,12 +944,13 @@ class Pipeline:
             cat[f"tcor_{idx}"][row] = tcor_H
             cat[f"apf_data_{idx}"][row] = d["apf_data"]
             cat[f"aper_rphi_{idx}"][row] = d["aper_rphi"]
-            cat[f"tcor_w_{idx}"][row] = d["tcor_w"]
-            cat[f"aper_pred_{idx}"][row] = d["aper_pred"]
             cat[f"apcor_{idx}"][row] = apcor1 * tcor_H
             cat[f"res_sum_{idx}"][row] = res_sum
             cat[f"res_seg_{idx}"][row] = d["res_seg"]
             cat[f"ap_flux_{idx}"][row] = ap_model + res_sum
+            # Estimator 1 (IDL-exact): aperture flux on the neighbour-subtracted
+            # image (ap_model + res_sum) scaled to total by totcor1.
+            cat[f"ap_flux_est1_{idx}"][row] = (ap_model + res_sum) * totcor1
             # Estimator 2 (IDL-consistent): model aperture flux scaled to total by
             # the internal template curve of growth (totcor1 = 1/apB), + residual.
             cat[f"ap_flux_est2_{idx}"][row] = ap_model * totcor1 + res_sum
