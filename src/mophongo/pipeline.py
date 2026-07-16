@@ -547,7 +547,11 @@ class Pipeline:
             # r_cap is a multiple of 0.25 (0.5 * integer), so rounding cannot
             # push the radius back above the cap.
             r_circ = float(np.round(r_circ * 4.0) / 4.0)
-            if False:  # TEMP-REVERT: pre-fix behavior for test verification
+            if capped:
+                # Shared-radius invariant: photutils' Kron flux was measured
+                # on the larger, edge-truncated elliptical aperture; re-measure
+                # the numerator as the circular flux at the SAME capped radius
+                # the EE denominator will use.
                 kron_flux = orig_t.template_norm * self._aperture_sum_on_template(orig_t, r_circ)
             return kron_flux, r_circ
         except Exception:  # pragma: no cover - degenerate stamp/segment
