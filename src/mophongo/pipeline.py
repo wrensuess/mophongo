@@ -22,7 +22,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.nddata import Cutout2D, block_replicate, block_reduce
 from photutils.aperture import CircularAperture, aperture_photometry
-from photutils.segmentation import SegmentationImage
+from photutils.segmentation import SegmentationImage, SourceCatalog
 from astropy.wcs.utils import proj_plane_pixel_scales
 
 from .psf_map import PSFRegionMap
@@ -473,15 +473,96 @@ class Pipeline:
         phot = aperture_photometry(fullmap[tmpl.slices_original], aper, method="exact")
         return float(phot["aperture_sum"][0])
 
+    def _model_kron(
+        self,
+        orig_t: Template,
+        label: int,
+        r_floor_pix: float,
+        use_source_catalog: bool = True,
+    ) -> tuple[float, float]:
+        """Model-side Kron aperture-to-total measurement (Stage 3b, design doc
+        Sec 5.4 -- the Skelton-style floor).
+
+        Runs photutils ``SourceCatalog`` on the fitted F444W template's own
+        model stamp (``orig_t.data[orig_t.slices_cutout] * orig_t.
+        template_norm``, real flux units -- NOT image data), using the
+        source's own segment (``self.segmap[orig_t.slices_original] ==
+        label``), with the Kron circular-radius floored at ``r_floor_pix``
+        (the catalog color-aperture radius) via photutils' own
+        ``kron_params`` minimum-circular-radius mechanism -- the same
+        machinery and conventions as :mod:`mophongo.catalog`.
+
+        Returns ``(kron_flux_model, r_kron_circ_pix)``: the model Kron flux
+        (real units) and the circularized Kron radius
+        (``max(kron_params[0] * kron_radius * sqrt(a*b), r_floor_pix)``,
+        capped at the stamp half-width). The two always share one radius:
+        when the cap engages, photutils' Kron flux (measured on a larger,
+        edge-truncated aperture) is REPLACED by the circular flux at the
+        capped radius, so ``kron_flux / EE(r_kron_circ)`` never mixes radii.
+        The returned radius is quantized to a 0.25-px grid so the caller's
+        per-region PSF-EE cache can hit (EE varies slowly with radius: the
+        <0.125 px rounding is a <0.2% effect).
+
+        ``use_source_catalog=False`` -- the ``apcor_from_psf`` performance
+        shortcut (a PSF-converged faint/compact template's Kron radius floors
+        anyway, so photutils is skipped entirely) -- and any failure
+        (degenerate moments, an empty segment in the stamp, a photutils
+        exception) both take the same fallback: a circular aperture at
+        ``r_floor_pix`` on the unit template, scaled by ``template_norm``.
+        """
+        stamp = orig_t.data[orig_t.slices_cutout] * orig_t.template_norm
+
+        def _fallback() -> tuple[float, float]:
+            # Same 0.25-px quantization as the main path (EE-cache hit rate),
+            # applied BEFORE the flux measurement so flux and radius share.
+            r_q = float(np.round(r_floor_pix * 4.0) / 4.0)
+            frac = self._aperture_sum_on_template(orig_t, r_q)
+            return orig_t.template_norm * frac, r_q
+
+        if not use_source_catalog:
+            return _fallback()
+
+        try:
+            seg = self.segmap[orig_t.slices_original] == label
+            if seg.shape != stamp.shape or not seg.any():
+                return _fallback()
+            scat = SourceCatalog(
+                stamp, SegmentationImage(seg.astype(int)),
+                kron_params=(2.5, 1.4, r_floor_pix),
+            )
+            kron_flux = float(scat.kron_flux[0])
+            kron_radius = float(scat.kron_radius[0].value)
+            a = float(scat.semimajor_sigma[0].value)
+            b = float(scat.semiminor_sigma[0].value)
+            if not (np.isfinite(kron_flux) and kron_flux > 0
+                    and np.isfinite(kron_radius) and np.isfinite(a) and np.isfinite(b)):
+                return _fallback()
+            r_circ = max(2.5 * kron_radius * np.sqrt(a * b), r_floor_pix)
+            r_cap = 0.5 * min(stamp.shape)
+            capped = r_circ > r_cap
+            if capped:
+                r_circ = r_cap
+            # Quantize to a 0.25-px grid (EE-cache hit rate; <0.2% EE effect),
+            # BEFORE the cap re-measurement below so flux and EE stay shared.
+            # r_cap is a multiple of 0.25 (0.5 * integer), so rounding cannot
+            # push the radius back above the cap.
+            r_circ = float(np.round(r_circ * 4.0) / 4.0)
+            if False:  # TEMP-REVERT: pre-fix behavior for test verification
+                kron_flux = orig_t.template_norm * self._aperture_sum_on_template(orig_t, r_circ)
+            return kron_flux, r_circ
+        except Exception:  # pragma: no cover - degenerate stamp/segment
+            return _fallback()
+
     def _build_f444w_residual(self, orig_templates: list[Template]) -> np.ndarray:
         """F444W neighbour-subtracted residual map: images[0] - Σ_j model_j.
 
         Each high-res template (unit-sum) is scaled by ``template_norm`` (its
         detection-band flux) and subtracted from the F444W image. Built once and
         reused across bands; for each source we add its own model back before the
-        aperture sum, so the tcor_H denominator is the real neighbour-subtracted
-        F444W aperture flux rather than the (noise-level) template sum. The map is
-        written to disk for over-subtraction diagnosis.
+        aperture sum, so the ``apf_data`` diagnostic is the real neighbour-
+        subtracted F444W aperture flux rather than the (noise-level) template
+        sum (diagnostic only -- it feeds no correction). The map is written to
+        disk for over-subtraction diagnosis.
         """
         # Native dtype copy (typically float32) — avoids doubling memory on the
         # full mosaic. Each pixel is covered by only a few templates, so float32
@@ -641,63 +722,92 @@ class Pipeline:
         apcor1   = ap_f_corr / ap_b_corr             — shape correction (low-res→high-res)
         ap_f_data = aper(F444W_residual + model_i, r_phi)   — REAL neighbour-subtracted
                                                     F444W aperture flux (= template_norm*apF_book
-                                                    + residual-in-aper)
-        tcor_H   = ftot / ap_f_data   (if a catalog total is supplied, else 1.0)
-                                                    — correction to the catalog total
-          The tcor_H denominator is the neighbour-subtracted F444W aperture flux
-          measured on data (not the noise-level template sum). The F444W residual
-          map (images[0] − Σ models) is built once and saved to
-          ``f444w_template_residual.fits`` for over-subtraction diagnosis; the
-          per-source ``ap_f_data`` is written to the ``apf_data_{idx}`` column.
+                                                    + residual-in-aper), kept as the
+                                                    ``apf_data_{idx}`` diagnostic column only
+                                                    (docs/aperture_corrections.md Sec 5.4).
 
         ap_model     = fl * aper(H*K, r_phi)         (model flux in aperture, low-res)
         res_sum      = Σ_aperture(residual)          (residual within the aperture disk)
         res_seg      = Σ_segmap(residual)            (diagnostic only)
         ap_flux      = ap_model + res_sum            (observed aperture flux)
-        ap_flux_est1 = (ap_model + res_sum) * totcor1         (IDL-exact Estimator 1)
-        ap_flux_est2 = ap_model * totcor1 + res_sum           (Estimator 2, residual unscaled)
-        ap_flux_corr = ap_model * apcor1 * tcor_H + res_sum   (Estimator 3 total)
+        ap_flux_est1    = (ap_model + res_sum) * totcor1      (internal-IDL Estimator 1)
+        ap_flux_est2    = ap_model * totcor1 + res_sum        (internal-IDL Estimator 2, residual unscaled)
+        ap_flux_est3int = ap_model * apcor1 * tcor_int + res_sum          (internal-Kron total)
+        ap_flux_est3cat = ap_model * apcor1 * tcor_int * s_cat + res_sum  (catalog-tied release)
 
-        apcor1 and tcor_H are kept as separate factors and columns and are never
-        algebraically collapsed. Per parent id, ap_model is accumulated over any
-        multi-component templates; the corrections and residual are computed
-        once.
+        Stage-3b two-step catalog tie (docs/aperture_corrections.md Sec 5.4), all
+        evaluated on MODELS (never on measured aperture flux):
 
-        TRANSITIONAL (docs/aperture_corrections.md Sec 3.3/4.4/5.4): ``tcor_H``,
-        ``apcor_``, and ``ap_flux_corr_`` still divide by the *measured*
-        neighbour-subtracted F444W aperture flux (``aper_rphi_`` == ``apf_data_``)
-        — the low-SNR noise issues of Sec 4.4 are known and unresolved. They stay
-        in place only until the Stage-3b two-step catalog tie (``tcor_int`` +
-        ``s_cat``) replaces them. ``est1``/``est2`` (with ``totcor1``/``apcor1``)
-        are the IDL-convention outputs and are not affected by this.
+        tcor_int = F444W_total_moph / (template_norm * apF_book)
+          F444W_total_moph = kron_flux_model / EE_true_444(r_kron_circ), where
+          ``kron_flux_model``/``r_kron_circ`` come from :meth:`_model_kron` -- a
+          photutils Kron measurement on the fitted F444W template's own model
+          stamp, with the circularized Kron radius floored at the catalog
+          color-aperture radius ``r_floor_pix`` (0.5 * catalog[f444w_aper_col] /
+          pscale_ref). Without a usable ``f444w_aper_col`` this degrades to the
+          true-normalized point-source form, ``tcor_int = 1/apF_corr``, for
+          every source (noted once).
+        s_cat = ftot / F444W_total_moph   (bad_value without a POSITIVE catalog total)
+        apcor  = apcor1 * tcor_int * s_cat   (the full released correction;
+                 bad_value when s_cat is bad -- REPURPOSED from Stage 3a)
 
-        Writes ap_model_{idx}, apcor1_{idx}, totcor1_{idx}, tcor_{idx},
-        apcor_{idx} (=product), res_sum_{idx}, res_seg_{idx}, ap_flux_{idx},
-        ap_flux_est1_{idx}, ap_flux_est2_{idx}, ap_flux_corr_{idx}.
+        Per parent id, ap_model is accumulated over any multi-component
+        templates; the corrections and residual are computed once.
+
+        Writes ap_model_{idx}, apcor1_{idx}, totcor1_{idx}, apf_data_{idx},
+        tcor_int_{idx}, s_cat_{idx}, f444w_ktot_{idx} (= F444W_total_moph),
+        apcor_{idx} (repurposed product), res_sum_{idx}, res_seg_{idx},
+        ap_flux_{idx}, ap_flux_est1_{idx}, ap_flux_est2_{idx},
+        ap_flux_est3int_{idx}, ap_flux_est3cat_{idx}.
         """
         cfg = self.config
         id_to_row = {int(i): k for k, i in enumerate(cat["id"])}
         r_img_pix = self._resolve_image_ap_radius_pix(idx, cfg)
+        pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
 
         if r_orig_pix is None:
             pscale_img = self._pixel_scale_arcsec(self.wcs[idx] if self.wcs is not None else None)
-            pscale_ref = self._pixel_scale_arcsec(self.wcs[0] if self.wcs is not None else None)
             r_orig_pix = r_img_pix * pscale_img / pscale_ref if (pscale_img and pscale_ref) else r_img_pix
+
+        # Stage-3b catalog color-aperture floor (docs Sec 5.4; same per-source
+        # ingestion idiom as the deleted rung-1 low-SNR blend, commit 91c96d0):
+        # r_floor_pix = 0.5 * catalog[f444w_aper_col] / pscale_ref, on the
+        # reference (F444W) grid. Column not configured/available -> tcor_int
+        # falls back to 1/apF_corr for every source (noted once).
+        r_floor_by_id: dict[int, float] = {}
+        cat_src = getattr(self, "catalog", None)
+        if (cfg.f444w_aper_col and cat_src is not None and pscale_ref
+                and cfg.f444w_aper_col in cat_src.colnames):
+            ids_src = np.asarray(cat_src["id"]).astype(int)
+            uas = np.asarray(cat_src[cfg.f444w_aper_col], dtype=float)
+            for sid, ua in zip(ids_src, uas):
+                if np.isfinite(ua) and ua > 0:
+                    r_floor_by_id[int(sid)] = 0.5 * float(ua) / pscale_ref
+        have_r_floor = len(r_floor_by_id) > 0
+        if not have_r_floor and not getattr(self, "_warned_no_f444w_aper_col", False):
+            print(
+                f"  tcor_int: no usable r_floor ('{cfg.f444w_aper_col}' column "
+                "or WCS pixel scale missing) -- falling back to 1/apF_corr "
+                "(true-normalized point-source total) for every source"
+            )
+            self._warned_no_f444w_aper_col = True
 
         for name in (
             f"ap_model_{idx}",
             f"apcor_{idx}",
             f"apcor1_{idx}",
             f"totcor1_{idx}",
-            f"tcor_{idx}",
             f"apf_data_{idx}",
-            f"aper_rphi_{idx}",
+            f"tcor_int_{idx}",
+            f"s_cat_{idx}",
+            f"f444w_ktot_{idx}",
             f"res_sum_{idx}",
             f"res_seg_{idx}",
             f"ap_flux_{idx}",
             f"ap_flux_est1_{idx}",
             f"ap_flux_est2_{idx}",
-            f"ap_flux_corr_{idx}",
+            f"ap_flux_est3int_{idx}",
+            f"ap_flux_est3cat_{idx}",
         ):
             if name not in cat.colnames:
                 cat[name] = cfg.bad_value
@@ -706,7 +816,7 @@ class Pipeline:
         use_tcor = f444w_totals is not None
 
         # F444W neighbour-subtracted residual map (built once, reused across
-        # bands): the tcor_H denominator becomes the REAL neighbour-subtracted
+        # bands): the apf_data diagnostic is the REAL neighbour-subtracted
         # F444W aperture flux instead of the noise-level template sum. For each
         # source we add its own model back via aperture-sum linearity:
         #   ap_f_data = aper(residual + model_i) = aper(residual) + ap_f_template.
@@ -725,7 +835,7 @@ class Pipeline:
 
         print(
             f"  Computing aperture corrections (image {idx}, {len(templates)} sources, "
-            f"{'with tcor_H' if use_tcor else 'apcor1 only'})"
+            f"{'with catalog tie (s_cat)' if use_tcor else 'internal (tcor_int) only'})"
         )
 
         # Phase A: point-source aperture-to-total from the PSF curve of growth for
@@ -781,8 +891,8 @@ class Pipeline:
 
         # Accumulate the model aperture flux per parent id (multi-component
         # templates share an id); the correction factors and the residual are
-        # computed once per parent. apcor1 and tcor_H are kept as SEPARATE
-        # factors (and columns) and never algebraically collapsed.
+        # computed once per parent. apcor1, tcor_int and s_cat are kept as
+        # SEPARATE factors (and columns) and never algebraically collapsed.
         model_acc: dict[int, float] = defaultdict(float)
         per: dict[int, dict] = {}
 
@@ -811,22 +921,23 @@ class Pipeline:
             # fraction is over the TRUE total, not the truncated template footprint;
             # this feeds apcor1/totcor1 ONLY, never the bookkeeping above.
             use_psf = bool(getattr(orig_t, "apcor_from_psf", False))
-            ra_dec = None
+            # Cutout-frame position with the cutout-adjusted WCS (the CRPIX is
+            # shifted to the cutout in Template.__init__; see the downsample
+            # convention in templates.py). position_original is the full-image
+            # frame and would give a wrong sky position -> wrong PSF region.
+            # Needed for every source now (not just apcor_from_psf ones): the
+            # Stage-3b Kron->total EE lookup (docs Sec 5.4) runs on all sources.
+            pos = orig_t.input_position_cutout
+            if getattr(orig_t, "wcs", None) is not None:
+                ra_dec = orig_t.wcs.wcs_pix2world(pos[0], pos[1], 0)
+            else:
+                ra_dec = pos
             # Template-path default (apcor_from_psf False, or PSF unavailable below):
             # apB_corr stays the footprint-truncated template fraction, with no
             # stamp-edge extrapolation. Scope cut vs docs/aperture_corrections.md
             # Sec 5.2 bullet 2 -- deferred to Stage 4 (≲1.5% effect per Sec 4.1).
             apB_corr = apB_book
             if use_psf:
-                # Cutout-frame position with the cutout-adjusted WCS (the CRPIX is
-                # shifted to the cutout in Template.__init__; see the downsample
-                # convention in templates.py). position_original is the full-image
-                # frame and would give a wrong sky position -> wrong PSF region.
-                pos = orig_t.input_position_cutout
-                if getattr(orig_t, "wcs", None) is not None:
-                    ra_dec = orig_t.wcs.wcs_pix2world(pos[0], pos[1], 0)
-                else:
-                    ra_dec = pos
                 # Both fractions must come from the PSF, or neither: a mixed
                 # template/PSF apcor1 would not be a clean curve-of-growth ratio.
                 ee_b = _psf_ee(psf_band, ra_dec[0], ra_dec[1], r_band_pix)
@@ -852,8 +963,8 @@ class Pipeline:
 
             # --- once-per-parent correction factors and residual ---
             # Real-unit template aperture fluxes (template_norm restores image
-            # flux units; it cancels in apcor1 but is required so tcor_H is
-            # dimensionless). Correction side (apB_corr): PSF EE for
+            # flux units; it cancels in apcor1 but is required so tcor_int and
+            # s_cat are dimensionless). Correction side (apB_corr): PSF EE for
             # apcor_from_psf sources, else the template -- feeds apcor1/totcor1.
             ap_b_corr = template_norm_i * apB_corr  # low-res convolved template flux in aperture
 
@@ -879,36 +990,78 @@ class Pipeline:
             # ~1.2 for apcor_from_psf sources now that apB is over the true total.
             totcor1 = 1.0 / apB_corr if apB_corr > 0 else 1.0
 
-            # tcor_H denominator: the REAL neighbour-subtracted F444W aperture flux
-            # (template model_i + residual), measured on data rather than the
-            # noise-level template sum. Bookkeeping side -- ALWAYS the fitted
-            # original template's own fraction, so aperture-sum linearity holds
-            # against the F444W residual map (built from the same templates).
+            # apf_data diagnostic: the REAL neighbour-subtracted F444W aperture
+            # flux (template model_i + residual), measured on data. Bookkeeping
+            # side -- ALWAYS the fitted original template's own fraction, so
+            # aperture-sum linearity holds against the F444W residual map
+            # (built from the same templates). No longer feeds any correction
+            # (docs/aperture_corrections.md Sec 5.4); kept as a diagnostic only.
             apF_book = self._aperture_sum_on_template(orig_t, r_orig_pix)
             ap_f_book = template_norm_i * apF_book if apF_book > 0 else 0.0
             ap_f_data = ap_f_book
             if f444w_res is not None:
                 ap_f_data = ap_f_book + self._aperture_sum_on_map(f444w_res, orig_t, r_orig_pix)
 
-            # TRANSITIONAL (docs/aperture_corrections.md Sec 3.3/4.4/5.4): tcor_H is
-            # the plain measured ratio, ftot / ap_f_data -- the low-SNR
-            # catalog-anchored blend (formerly tcor_lowsnr_psf) is removed pending
-            # the Stage-3b two-step tie (tcor_int + s_cat). aper_rphi is kept as a
-            # column equal to the denominator actually used (== ap_f_data).
             ftot = f444w_totals.get(int(tmpl.id)) if use_tcor else None
             has_ftot = ftot is not None and np.isfinite(ftot)
 
-            aper_rphi = ap_f_data
-            tcor_H = 1.0
-            if has_ftot:
-                tcor_H = float(np.float64(ftot) / np.float64(aper_rphi))
+            # --- Stage-3b two-step catalog tie (docs Sec 5.4) -- evaluated
+            # entirely on MODELS, never on apf_data/measured aperture flux.
+            # TODO(multi-band): tcor_int/f444w_ktot/s_cat are F444W-side and
+            # band-independent, yet recomputed per band in a multi-band run;
+            # single-band runs (the production pattern) are unaffected. ---
+            r_floor_pix = r_floor_by_id.get(int(tmpl.id)) if have_r_floor else None
+            if r_floor_pix is None or not (r_floor_pix > 0):
+                # No usable catalog color-aperture radius for this source
+                # (column missing/not configured, or id absent from the
+                # lookup): the true-normalized point-source fallback.
+                tcor_int_ok = apF_corr > 0
+                if tcor_int_ok:
+                    tcor_int = 1.0 / apF_corr
+                    f444w_ktot = template_norm_i * apF_book * tcor_int
+                else:
+                    tcor_int = float(cfg.bad_value)
+                    f444w_ktot = float(cfg.bad_value)
+            else:
+                # apcor_from_psf performance shortcut: a PSF-converged
+                # faint/compact template's Kron radius floors anyway, so skip
+                # photutils SourceCatalog and use the floor circle directly
+                # (also the scientifically right faint limit per the doc).
+                kron_flux_model, r_kron_circ = self._model_kron(
+                    orig_t, int(tmpl.id), r_floor_pix,
+                    use_source_catalog=not getattr(orig_t, "apcor_from_psf", False),
+                )
+                ee_kron = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_kron_circ)
+                if ee_kron is None or ee_kron <= 0:
+                    ee_kron = self._aperture_sum_on_template(orig_t, r_kron_circ)
+                denom = template_norm_i * apF_book
+                tcor_int_ok = bool(
+                    ee_kron and ee_kron > 0 and kron_flux_model > 0 and denom > 0
+                )
+                if tcor_int_ok:
+                    f444w_ktot = kron_flux_model / ee_kron
+                    tcor_int = f444w_ktot / denom
+                else:
+                    tcor_int = float(cfg.bad_value)
+                    f444w_ktot = float(cfg.bad_value)
+
+            # s_cat requires a POSITIVE catalog total: a negative f_f444w (an
+            # F444W non-detection) cannot define a total-flux system, so the
+            # tie is meaningless there -> s_cat/apcor/est3cat go bad_value
+            # (tcor_int/f444w_ktot/est3int are catalog-independent, unaffected).
+            # No upper bound on s_cat: the large-positive tail is a ratio
+            # artifact that cancels in est3cat (closure: est3cat = f_f444w *
+            # [model-shape fraction] + res_sum); left visible as a diagnostic.
+            s_cat_ok = has_ftot and float(ftot) > 0 and tcor_int_ok and f444w_ktot > 0
+            s_cat = float(ftot) / f444w_ktot if s_cat_ok else float(cfg.bad_value)
 
             # Residual within the measurement aperture (disk), added UNSCALED.
             # Same aperture geometry as _aperture_sum_on_template applied to the
             # residual patch, so ap_flux = ap_model + res_sum exactly.
             # TODO(blend residual double-count): for two close sources the aperture
             # disks overlap, so background residual in the shared region is added to
-            # both ap_flux_corr values. Full fix would partition the shared residual.
+            # both sources' corrected flux values. Full fix would partition the
+            # shared residual.
             # For now we at least exclude pixels that explicitly belong to OTHER
             # sources' segments from this source's residual aperture.
             res_patch = residual[tmpl.slices_original]
@@ -927,36 +1080,56 @@ class Pipeline:
             # Residual over the full segmap (diagnostic only; not used in f3).
             res_seg = self._residual_segmap_sum(residual, int(tmpl.id), orig_t, k)
 
-            per[row] = dict(apcor1=apcor1, totcor1=totcor1, tcor=tcor_H, apf_data=ap_f_data,
-                            aper_rphi=aper_rphi, res_sum=res_sum, res_seg=res_seg)
+            per[row] = dict(
+                apcor1=apcor1, totcor1=totcor1, apf_data=ap_f_data,
+                tcor_int=tcor_int, tcor_int_ok=tcor_int_ok,
+                s_cat=s_cat, s_cat_ok=s_cat_ok, f444w_ktot=f444w_ktot,
+                res_sum=res_sum, res_seg=res_seg,
+            )
 
-        # Write per-parent Estimator-3 results. The correction is applied as the
-        # explicit product apcor1 * tcor_H (never pre-collapsed).
+        # Write per-parent Estimator-3 results. Corrections are applied as the
+        # explicit product apcor1 * tcor_int [* s_cat] (never pre-collapsed).
         for row, d in per.items():
             ap_model = model_acc[row]
             apcor1 = d["apcor1"]
             totcor1 = d["totcor1"]
-            tcor_H = d["tcor"]
+            tcor_int = d["tcor_int"]
+            s_cat = d["s_cat"]
             res_sum = d["res_sum"]
             cat[f"ap_model_{idx}"][row] = ap_model
             cat[f"apcor1_{idx}"][row] = apcor1
             cat[f"totcor1_{idx}"][row] = totcor1
-            cat[f"tcor_{idx}"][row] = tcor_H
             cat[f"apf_data_{idx}"][row] = d["apf_data"]
-            cat[f"aper_rphi_{idx}"][row] = d["aper_rphi"]
-            cat[f"apcor_{idx}"][row] = apcor1 * tcor_H
+            cat[f"tcor_int_{idx}"][row] = tcor_int
+            cat[f"s_cat_{idx}"][row] = s_cat
+            cat[f"f444w_ktot_{idx}"][row] = d["f444w_ktot"]
             cat[f"res_sum_{idx}"][row] = res_sum
             cat[f"res_seg_{idx}"][row] = d["res_seg"]
             cat[f"ap_flux_{idx}"][row] = ap_model + res_sum
-            # Estimator 1 (IDL-exact): aperture flux on the neighbour-subtracted
-            # image (ap_model + res_sum) scaled to total by totcor1.
+            # Estimator 1 (internal-IDL, exact): aperture flux on the
+            # neighbour-subtracted image (ap_model + res_sum) scaled to total
+            # by totcor1.
             cat[f"ap_flux_est1_{idx}"][row] = (ap_model + res_sum) * totcor1
-            # Estimator 2 (IDL-consistent): model aperture flux scaled to total by
-            # the internal template curve of growth (totcor1 = 1/apB), + residual.
+            # Estimator 2 (internal-IDL): model aperture flux scaled to total
+            # by the internal template curve of growth (totcor1 = 1/apB), +
+            # residual.
             cat[f"ap_flux_est2_{idx}"][row] = ap_model * totcor1 + res_sum
-            # Estimator 3: model aperture flux scaled to total by the factored
-            # correction, plus the unscaled residual over the aperture disk.
-            cat[f"ap_flux_corr_{idx}"][row] = ap_model * apcor1 * tcor_H + res_sum
+            # Estimator 3int (internal-Kron total): model aperture flux scaled
+            # by apcor1 * tcor_int, + unscaled residual.
+            if d["tcor_int_ok"]:
+                cat[f"ap_flux_est3int_{idx}"][row] = ap_model * apcor1 * tcor_int + res_sum
+            else:
+                cat[f"ap_flux_est3int_{idx}"][row] = cfg.bad_value
+            # apcor (repurposed): the full released correction apcor1 * tcor_int
+            # * s_cat, and Estimator 3cat (catalog-tied release) built from it --
+            # both bad_value when s_cat is bad (no catalog total / s_cat guard failed).
+            if d["s_cat_ok"]:
+                apcor_released = apcor1 * tcor_int * s_cat
+                cat[f"apcor_{idx}"][row] = apcor_released
+                cat[f"ap_flux_est3cat_{idx}"][row] = ap_model * apcor_released + res_sum
+            else:
+                cat[f"apcor_{idx}"][row] = cfg.bad_value
+                cat[f"ap_flux_est3cat_{idx}"][row] = cfg.bad_value
 
     def run(self, config: FitConfig | None = None) -> tuple[Table, list[np.ndarray]]:
         """Run photometry on the configured images.

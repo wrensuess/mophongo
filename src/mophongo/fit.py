@@ -93,10 +93,13 @@ class FitConfig:
     aperture_units: str = "arcsec"  # "arcsec" or "pix"
     f444w_col: str | None = None  # catalog column for F444W total flux (enables Yoshi Mode B correction)
     # Catalog columns for the Stage-3b two-step catalog tie (design doc Sec 5.4):
-    # f444w_totcor_col = the aperture(color)->total factor (e.g. "tot_cor"),
-    # f444w_aper_col = the color-aperture DIAMETER in arcsec (e.g. "use_aper"). Not
-    # yet consumed (the internal Kron total tcor_int + s_cat land in Stage 3b);
-    # reserved here so the catalog plumbing doesn't change twice.
+    # f444w_totcor_col = the aperture(color)->total factor (e.g. "tot_cor");
+    # currently unused (kept for diagnostics/alternative ties -- the internal
+    # Kron total is measured directly from the model, not this catalog column).
+    # f444w_aper_col = the color-aperture DIAMETER in arcsec (e.g. "use_aper"),
+    # consumed by _add_aperture_photometry as the Kron circular-radius floor
+    # (r_floor_pix = 0.5*f444w_aper_col/pscale_ref); without it tcor_int falls
+    # back to 1/apF_corr for every source.
     f444w_totcor_col: str | None = None
     f444w_aper_col: str | None = None
 

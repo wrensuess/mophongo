@@ -545,8 +545,12 @@ comparison.
    (`totcor` > 1.45) med(py/IDL) → ~1 (from 0.81); no template-path tail above ~2 for
    F444W > 25 sources (cloud gone).
 3. **Fig 1(c,d)** with `ap_flux_est1_1`: residual median |μ| ≤ 0.02 mag for mag < 24.
-4. **Catalog side**: `tcor_int` and `s_cat` finite and bounded at every SNR (no negative or
-   >10 values); Fig 2(b,d) residual median → 0.
+4. **Catalog side**: `tcor_int` finite and bounded at every SNR; `s_cat > 0` enforced (a
+   negative catalog `f_f444w` cannot define a total-flux system — those sources get
+   bad_value in the catalog-tied columns only). The large-positive `s_cat` tail for
+   F444W-marginal sources is a ratio diagnostic that cancels algebraically in `est3cat`
+   (closure: est3cat = f_f444w·B + res_sum) — report its size, don't clip it. Fig 2(b,d)
+   residual median → 0.
 5. **Regression**: fitted amplitudes `flux_1` unchanged where the template construction is
    unchanged; every change in `ap_*` columns attributable to a named fix.
 
