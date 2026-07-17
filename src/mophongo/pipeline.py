@@ -713,14 +713,21 @@ class Pipeline:
 
         Invariant: real-flux bookkeeping (``ap_model``, ``ap_flux``, ``ap_f_data``)
         always uses the fitted template's own aperture fraction, since ``fl`` and
-        ``template_norm`` are defined against that unit-sum template; PSF curve-
-        of-growth fractions (for ``apcor_from_psf`` sources) enter ONLY the
-        correction factors ``apcor1``/``totcor1``.
+        ``template_norm`` are defined against that unit-sum template; the
+        per-source truncation term (below) enters ONLY the correction factors
+        ``apcor1``/``totcor1``.
 
         Templates are unit-sum normalised; ``orig_t.template_norm`` holds the
         pre-normalisation detection-band sum, converting aperture fractions to
         real flux units. All quantities below in real (image) flux units:
 
+        trunc    = template_norm / (template_norm + flux_beyond_stamp)  — per-source
+                   truncation (docs/aperture_corrections.md Sec 5.1/6); flux_beyond_stamp
+                   is the unified template's PSF-extrapolated, core-anchored estimate
+                   of this source's flux beyond the cutout (set in
+                   ``Templates._extended_composite``).
+        apB_corr = apB_book * trunc, apF_corr = apF_book * trunc   — trunc cancels in
+                   apcor1 (a shape ratio) and survives in totcor1 (aperture-to-total).
         ap_b_corr = template_norm * apB_corr         — low-res aperture flux, correction side
         ap_f_corr = template_norm * apF_corr         — high-res aperture flux, correction side
         apcor1   = ap_f_corr / ap_b_corr             — shape correction (low-res→high-res)
@@ -842,25 +849,14 @@ class Pipeline:
             f"{'with catalog tie (s_cat)' if use_tcor else 'internal (tcor_int) only'})"
         )
 
-        # Phase A: point-source aperture-to-total from the PSF curve of growth for
-        # ``apcor_from_psf`` (faint / bright+compact) templates, whose shape is
-        # unmeasurable so the footprint-truncated template under-counts the total.
-        # apF = EE(PSF_hires, r_orig); apB = EE(PSF_band, r_img) -- the matching
-        # kernel makes PSF_hires⊗K = PSF_band, so the band PSF gives the convolved
-        # curve of growth directly. EE cached per PSF-region id (few distinct).
+        # psf_hires (F444W detection PSF) is still needed for _model_kron's
+        # EE_true_444(r_kron) lookup (docs/aperture_corrections.md Sec 5.4);
+        # the PSF-EE apB_corr/apF_corr branch itself is gone (Sec 5.1 -- the
+        # unified template makes apB/apF a single footprint-truncated fraction
+        # for every source, corrected uniformly by the per-source truncation
+        # term below). EE cached per PSF-region id (few distinct).
         psf_hires = self.psfs[0] if (self.psfs is not None and len(self.psfs) > 0) else None
-        psf_band = self.psfs[idx] if (self.psfs is not None and len(self.psfs) > idx) else None
         _ee_cache: dict = {}
-
-        # Aperture radius for the BAND PSF EE (apB), in the band PSF's NATIVE pixel
-        # scale. psf_hires is on the reference grid so apF uses r_orig_pix directly,
-        # but psf_band is on its native grid; in upsample mode the fit grid (r_img_pix)
-        # is finer than the band PSF, so measuring apB at r_img_pix would sample the
-        # wrong physical radius (-> totcor1 collapses to ~1). Convert via native scales.
-        r_band_pix = r_img_pix
-        _psn = getattr(self, "_native_pscale", None)
-        if _psn and len(_psn) > idx and _psn[0] and _psn[idx]:
-            r_band_pix = r_orig_pix * float(_psn[0]) / float(_psn[idx])
 
         def _psf_ee(psfmap, ra, dec, radius):
             if psfmap is None:
@@ -920,36 +916,17 @@ class Pipeline:
             if apB_book <= 0:
                 continue
 
-            # Correction-side convolved aperture fraction. For point-source-like
-            # (apcor_from_psf) templates use the band PSF curve of growth so the
-            # fraction is over the TRUE total, not the truncated template footprint;
-            # this feeds apcor1/totcor1 ONLY, never the bookkeeping above.
-            use_psf = bool(getattr(orig_t, "apcor_from_psf", False))
             # Cutout-frame position with the cutout-adjusted WCS (the CRPIX is
             # shifted to the cutout in Template.__init__; see the downsample
             # convention in templates.py). position_original is the full-image
             # frame and would give a wrong sky position -> wrong PSF region.
-            # Needed for every source now (not just apcor_from_psf ones): the
-            # Stage-3b Kron->total EE lookup (docs Sec 5.4) runs on all sources.
+            # Needed for the Stage-3b Kron->total EE lookup (docs Sec 5.4),
+            # which runs on all sources.
             pos = orig_t.input_position_cutout
             if getattr(orig_t, "wcs", None) is not None:
                 ra_dec = orig_t.wcs.wcs_pix2world(pos[0], pos[1], 0)
             else:
                 ra_dec = pos
-            # Template-path default (apcor_from_psf False, or PSF unavailable below):
-            # apB_corr stays the footprint-truncated template fraction, with no
-            # stamp-edge extrapolation. Scope cut vs docs/aperture_corrections.md
-            # Sec 5.2 bullet 2 -- deferred to Stage 4 (≲1.5% effect per Sec 4.1).
-            apB_corr = apB_book
-            if use_psf:
-                # Both fractions must come from the PSF, or neither: a mixed
-                # template/PSF apcor1 would not be a clean curve-of-growth ratio.
-                ee_b = _psf_ee(psf_band, ra_dec[0], ra_dec[1], r_band_pix)
-                ee_f = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix)
-                if (ee_b is not None and ee_b > 0) and (ee_f is not None and ee_f > 0):
-                    apB_corr = float(ee_b)
-                else:
-                    use_psf = False  # PSF unavailable -> template path for this source
 
             # Model flux inside the aperture (low-res grid), summed over any
             # multi-component templates that share this parent id.
@@ -966,32 +943,34 @@ class Pipeline:
                 continue  # once-per-parent quantities already computed
 
             # --- once-per-parent correction factors and residual ---
+            # High-res aperture fraction (footprint-truncated fitted template).
+            apF_book = self._aperture_sum_on_template(orig_t, r_orig_pix)
+
+            # Per-source truncation (docs/aperture_corrections.md Sec 5.1/6):
+            # the unified template's PSF-EE correction path collapses to one
+            # truncation term applied to BOTH apB_book and apF_book, replacing
+            # the old apcor_from_psf PSF-curve-of-growth branch. flux_beyond_stamp
+            # (set in _extended_composite) is the PSF-extrapolated, core-anchored
+            # estimate of this source's flux landing outside the cutout, in the
+            # same real-flux units as template_norm (Sigma(H)).
+            flux_beyond = float(getattr(orig_t, "flux_beyond_stamp", 0.0) or 0.0)
+            trunc_denom = template_norm_i + flux_beyond
+            trunc = template_norm_i / trunc_denom if trunc_denom > 0 else 1.0
+            apB_corr = apB_book * trunc
+            apF_corr = apF_book * trunc
+
             # Real-unit template aperture fluxes (template_norm restores image
             # flux units; it cancels in apcor1 but is required so tcor_int and
-            # s_cat are dimensionless). Correction side (apB_corr): PSF EE for
-            # apcor_from_psf sources, else the template -- feeds apcor1/totcor1.
+            # s_cat are dimensionless).
             ap_b_corr = template_norm_i * apB_corr  # low-res convolved template flux in aperture
-
-            # High-res aperture fraction, correction side: PSF curve of growth for
-            # apcor_from_psf sources (same true-total normalisation as apB_corr
-            # above), else the template. Both from the same source so apcor1 is a
-            # clean bounded ratio. Feeds apcor1 and the low-SNR blend prediction only.
-            apF_corr = None
-            if use_psf and ra_dec is not None:
-                ee_f = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix)
-                if ee_f is not None and ee_f > 0:
-                    apF_corr = float(ee_f)
-            if apF_corr is None:
-                # Template-path fallback: no stamp-edge extrapolation (same scope
-                # cut as apB_corr above; deferred to Stage 4).
-                apF_corr = self._aperture_sum_on_template(orig_t, r_orig_pix)
             ap_f_corr = template_norm_i * apF_corr if apF_corr > 0 else 0.0  # high-res template flux in aperture
 
             # Shape correction: high-res / low-res aperture flux (real units).
-            # Uses the template shapes (a clean, bounded ratio ~PSF curve of growth).
+            # trunc cancels exactly (apcor1 == apF_book/apB_book): a shape ratio
+            # is invariant to the source's total-flux truncation.
             apcor1 = ap_f_corr / ap_b_corr if (ap_b_corr > 0 and ap_f_corr > 0) else 1.0
-            # Internal aperture-to-total (design-doc Eq. 7; = IDL totcor). Bounded
-            # ~1.2 for apcor_from_psf sources now that apB is over the true total.
+            # Internal aperture-to-total (design-doc Eq. 7; = IDL totcor). trunc
+            # survives here (aperture-to-TOTAL, not a shape ratio).
             totcor1 = 1.0 / apB_corr if apB_corr > 0 else 1.0
 
             # apf_data diagnostic: the REAL neighbour-subtracted F444W aperture
@@ -1000,7 +979,6 @@ class Pipeline:
             # aperture-sum linearity holds against the F444W residual map
             # (built from the same templates). No longer feeds any correction
             # (docs/aperture_corrections.md Sec 5.4); kept as a diagnostic only.
-            apF_book = self._aperture_sum_on_template(orig_t, r_orig_pix)
             ap_f_book = template_norm_i * apF_book if apF_book > 0 else 0.0
             ap_f_data = ap_f_book
             if f444w_res is not None:
@@ -1300,6 +1278,8 @@ class Pipeline:
                     aperture_radius_pix=float(r_orig) if r_orig is not None else None,
                     fit_snrlo_psf=float(config.fit_snrlo_psf),
                     wings_snr_psf=float(config.wings_snr_psf),
+                    template_blend_p=float(config.template_blend_p),
+                    template_blend_annulus=float(config.template_blend_annulus),
                 )
                 logger.info(
                     "Template extension (auto): every template extended to no more "

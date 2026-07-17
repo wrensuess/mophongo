@@ -367,6 +367,24 @@ class AlignedCutout:
         return out
 
 
+def blend_weight(snr: float, thresh: float, p: float) -> float:
+    """Data weight for the unified data/PSF template blend (docs/
+    aperture_corrections.md Sec 5.1): 1 at/above ``thresh`` (pure data), a
+    smooth power-law rolloff below. ``thresh`` is the ONSET of PSF blending
+    (the weight saturates at 1 there), matching the old hard-switch branches
+    in the limit. Single module-level place so the functional form can be
+    swapped later without touching the call sites.
+    """
+    if thresh <= 0:
+        return 1.0
+    if np.isnan(snr):
+        return 0.0  # no usable SNR measurement -> defer to the PSF model
+    ratio = max(snr, 0.0) / thresh  # +/-inf resolve correctly (1.0 / 0.0)
+    if ratio >= 1.0:
+        return 1.0  # saturate before exponentiating (avoids overflow for huge snr)
+    return ratio ** p
+
+
 class Template(Cutout2D):
     """Cutout-based template storing slice bookkeeping."""
 
@@ -429,10 +447,17 @@ class Template(Cutout2D):
         self.template_norm: float = 0.0  # within-segmap detection flux in image units (pre-normalization sum)
         self.n_pix: int = 0  # segmap pixel count at extraction time
         self.snr_seg: float = float("nan")  # in-segment detection SNR (set in _extended_composite); NaN if not extended
-        # True when this source's shape is unmeasurable (faint or bright+compact ->
-        # PSF-branch in _extended_composite): the aperture-to-total correction is then
-        # taken from the PSF curve of growth, not the (footprint-truncated) template.
+        # True when the source is majority-PSF (snr_seg < fit_snrlo_psf, i.e. w_core
+        # well below 1): gates the _model_kron performance shortcut in pipeline.py
+        # (skip photutils SourceCatalog -- a PSF-converged template's Kron radius
+        # floors anyway). No longer switches how apcor1/totcor1 are computed; the
+        # unified template feeds those uniformly (docs/aperture_corrections.md Sec 5.1).
         self.apcor_from_psf: bool = False
+        # Model-estimated source flux landing beyond this cutout (real image-flux
+        # units, same convention as template_norm), from the PSF-extrapolated,
+        # core-anchored model (set in _extended_composite). 0.0 when extension is
+        # disabled/failed (fully footprint-truncated template).
+        self.flux_beyond_stamp: float = 0.0
         self.err = 0.0
         self.err_pred = 0.0  # predicted error from weight map and profile
         self.wnorm = 0.0  # weighted norm of the template d * w * d
@@ -1116,15 +1141,18 @@ class Templates:
     def _region_snr(img_stamp, ivar_stamp, mask, bg_rms) -> tuple[float, float]:
         """Integrated SNR and 1σ noise of ``img_stamp`` over ``mask``.
 
-        Noise prefers the formal value from the detection inverse-variance map
-        (``sqrt(Σ 1/ivar)`` over covered pixels), falling back to ``bg_rms·sqrt(n)``
-        when no weight map is available. Returns ``(snr, noise)``; the noise is
-        reused as ``e_seg`` for the low-SNR PSF prior amplitude.
+        The flux is clamped to non-negative before dividing (IDL's positive-pixel
+        treatment, docs/aperture_corrections.md Sec 2.1/5.1): a region with a
+        genuinely negative net sum is a non-detection, and should blend fully to
+        the PSF rather than report a negative SNR that never crosses a blend
+        threshold. Noise prefers the formal value from the detection
+        inverse-variance map (``sqrt(Σ 1/ivar)`` over covered pixels), falling
+        back to ``bg_rms·sqrt(n)`` when no weight map is available.
         """
         n = int(mask.sum())
         if n == 0:
             return 0.0, 0.0
-        flux = float(np.nansum(img_stamp[mask]))
+        flux = max(float(np.nansum(img_stamp[mask])), 0.0)
         noise = 0.0
         if ivar_stamp is not None:
             ivar = np.asarray(ivar_stamp, dtype=float)[mask]
@@ -1140,11 +1168,13 @@ class Templates:
         """Per-source detection PSF (ndarray, or PSFRegionMap lookup by sky pos)."""
         if not isinstance(detection_psf, PSFRegionMap):
             return np.asarray(detection_psf, dtype=float)
-        x, y = cut.position_original
+        # cut.wcs is the Cutout2D CRPIX-shifted cutout-frame WCS, so it must be
+        # fed CUTOUT-frame pixels; original-frame pixels give a sky position
+        # offset by the cutout's location in the mosaic -> wrong PSF region.
         if cut.wcs is not None:
-            ra, dec = cut.wcs.wcs_pix2world(x, y, 0)
+            ra, dec = cut.wcs.wcs_pix2world(*cut.input_position_cutout, 0)
         else:
-            ra, dec = x, y
+            ra, dec = cut.position_original
         psf_src = detection_psf.get_psf(ra, dec)
         if psf_src is None:
             return None
@@ -1159,18 +1189,23 @@ class Templates:
         self, cut, label, segm, hires_image, *, detection_psf,
         detection_weight, owner_map, max_radius_pix, psf_ee_radius_pix,
         aperture_radius_pix, fit_snrlo_psf, wings_snr_psf, bg_rms, psf_cache,
+        template_blend_p: float = 2.0, template_blend_annulus: float = 0.15,
     ) -> np.ndarray:
-        """Build the in-bounds composite for one source via the auto decision tree.
+        """Build the in-bounds composite for one source: a single radial,
+        SNR-weighted linear blend between the real detection-image data and a
+        data-anchored PSF model ``M``, applied uniformly over the source's
+        owned stamp (docs/aperture_corrections.md Sec 5.1). Real data wins
+        wherever it has SNR (core AND halo); the PSF model takes over smoothly
+        wherever it doesn't. This single template feeds the fit, ``ap_model``,
+        and every correction factor.
 
-        Two per-source SNRs choose how the composite ``H`` is built
-        (see ``FitConfig.template_extend_mode``):
-
-        - ``snr_seg``   : in-segment SNR. FAINT sources (``snr_seg <
-          1.5*fit_snrlo_psf``) get their core blended IN QUADRATURE with the
-          detection-PSF model so the template converges to a clean PSF.
-        - ``snr_wings`` : SNR of the owned wings out to the measurement aperture.
-          For bright sources this routes the wings to real data (extended,
-          ``snr_wings > wings_snr_psf``) or to scaled PSF wings (compact).
+        One core weight ``w_core`` (from the in-segment SNR, ``fit_snrlo_psf``
+        onset) blends the segment; one weight per radial halo annulus (from
+        that annulus' own SNR, ``wings_snr_psf`` onset) blends the halo out to
+        ``max_radius_pix``. Halo weights are forced monotone non-increasing
+        outward and seeded at ``w_core``, so data trust never increases with
+        radius and a faint core caps its halo. Beyond ``max_radius_pix`` but
+        within the PSF reach (``ee_reach``), only the PSF model contributes.
 
         Returns an array shaped like ``cut.data[cut.slices_cutout]``. Pixels are
         restricted to the source's area-weighted ``owner_map`` territory, so the
@@ -1185,6 +1220,11 @@ class Templates:
         )
         own = seg_stamp == label
         owned = owner_map[sl] == label  # this source's area-weighted territory
+        # Masked/NaN pixels carry no data: excluded from every SNR statistic
+        # and from the blend itself (they take the PSF model), so one bad pixel
+        # can never poison an annulus or NaN the whole normalized template.
+        finite = np.isfinite(img_stamp)
+        data_f = np.where(finite, img_stamp, 0.0).astype(img_stamp.dtype)
 
         # Source centre in the in-bounds (slices_cutout) frame.
         xs = cut.input_position_cutout[0] - cut.slices_cutout[1].start
@@ -1195,83 +1235,129 @@ class Templates:
 
         # Owned background halo (disjoint across sources via owner_map); the
         # `seg_stamp == 0` guard keeps a foreign segment's pixel out of this
-        # template. Data extension reaches `max_radius_pix`; PSF wings reach the
-        # 95% PSF-EE radius (both hard caps, so templates never grow unbounded).
+        # template. Data extension reaches `max_radius_pix`; PSF reach extends
+        # to the 95% PSF-EE radius (both hard caps, so templates never grow
+        # unbounded).
         ee_reach = psf_ee_radius_pix if psf_ee_radius_pix is not None else max_radius_pix
         bg_owned = owned & (seg_stamp == 0)
         ext_data = own | (bg_owned & (r2 <= float(max_radius_pix) ** 2))
         ext_psf = own | (bg_owned & (r2 <= float(ee_reach) ** 2))
 
-        # Two SNRs. snr_wings is measured on the owned wings only out to the
-        # measurement aperture (Rphi).
-        # TODO(wings-snr-radius): revisit whether the full owned halo
-        # (max_radius_pix) should be used here instead of the aperture radius.
-        snr_seg, e_seg = self._region_snr(img_stamp, ivar_stamp, own, bg_rms)
-        cut.snr_seg = float(snr_seg)  # persist for the low-SNR tcor_H blend in _add_aperture_photometry
-        ap_r = aperture_radius_pix if aperture_radius_pix is not None else max_radius_pix
-        wings_in_ap = bg_owned & (r2 <= float(ap_r) ** 2)
-        snr_wings, _ = self._region_snr(img_stamp, ivar_stamp, wings_in_ap, bg_rms)
+        # Core weight: one scalar for the whole segment, from the in-segment
+        # SNR (positive-pixel clamp -- genuine non-detections blend fully to
+        # the PSF). Onset at 1.5*fit_snrlo_psf (w saturates at 1 there,
+        # matching the old hard faint/bright switch in the limit).
+        snr_seg, _ = self._region_snr(img_stamp, ivar_stamp, own, bg_rms)
+        cut.snr_seg = float(snr_seg)  # persisted for diagnostics
+        w_core = blend_weight(snr_seg, 1.5 * fit_snrlo_psf, template_blend_p)
+        # _model_kron performance-shortcut gate (pipeline.py): majority-PSF
+        # sources (w_core well below 1) skip the photutils Kron measurement.
+        cut.apcor_from_psf = bool(snr_seg < fit_snrlo_psf)
 
-        faint = fit_snrlo_psf > 0 and 0.0 < snr_seg < 1.5 * fit_snrlo_psf
-        # Bright & extended: real data over owned pixels. Also the default when no
-        # usable noise estimate is available (e_seg <= 0) so we never lose flux.
-        extended = (not faint) and (e_seg <= 0 or snr_wings > wings_snr_psf)
-
-        if extended:
-            cut.flag |= Template.FLAG_PSF_EXTENDED
-            return img_stamp * ext_data
-
-        # FAINT or BRIGHT+COMPACT: both need the detection-PSF model.
         psf_src = self._lookup_detection_psf(cut, detection_psf, psf_cache)
         if psf_src is None or psf_src.sum() <= 0:
             cut.flag |= Template.FLAG_EXTEND_FAILED
-            return img_stamp * ext_data  # fall back to real-data extension
-        # PSF is actually used from here on: the composite is point-source-like
-        # (faint) or PSF-winged compact, so its aperture-to-total correction should
-        # come from the PSF curve of growth (Phase A), not the truncated template.
-        cut.apcor_from_psf = True
+            cut.flux_beyond_stamp = 0.0
+            return data_f * ext_data  # fall back to real-data extension
+
         psf_total = float(psf_src.sum())
         pcy = (psf_src.shape[0] - 1) / 2.0
         pcx = (psf_src.shape[1] - 1) / 2.0
         coords = np.array([pcy + (yy - ys), pcx + (xx - xs)])
-        # Unit-sum detection-PSF model sampled on the cutout grid, so the injected
-        # prior carries total SNR ~ fit_snrlo_psf and the wing amplitude is in flux.
+        # Recentered unit-sum detection-PSF model sampled on the cutout grid.
         psf_cut = map_coordinates(psf_src, coords, order=1, mode="constant", cval=0.0) / psf_total
 
-        comp = np.where(own, img_stamp, 0.0).astype(cut.data.dtype)
-        if faint:
-            # IDL :327-328 -- blend the core with the PSF model IN QUADRATURE:
-            # H_core = sqrt(data^2 + (e_seg*fit_snrlo_psf*psf)^2). Bright pixels are
-            # unchanged; faint/negative pixels converge to the (positive) PSF shape.
-            prior = e_seg * fit_snrlo_psf * psf_cut
-            comp[own] = np.sqrt(comp[own] ** 2 + prior[own] ** 2)
-            # Flux-preserving renormalisation: the quadrature blend fixes the core
-            # SHAPE (noise/negative pixels -> PSF) but ADDS flux (sqrt(a^2+b^2) >= a),
-            # so the composite sum -- and hence template_norm -- overestimates the
-            # true F444W flux. Used as a fitting basis this cancels in the unit-sum
-            # apcor ratio, but template_norm also scales the model SUBTRACTED to form
-            # the F444W neighbour residual / tcor denominator, where the inflation
-            # over-subtracts the core. Rescale the blended core so its total equals
-            # the real in-segment data flux, floored at the in-segment noise so
-            # genuine non-detections keep a sensible (~1 sigma) positive amplitude
-            # rather than collapsing to zero/negative. Shape unchanged; only the sum.
-            blended_sum = float(comp[own].sum())
-            target = max(float(img_stamp[own].sum()), float(e_seg))
-            if blended_sum > 0:
-                comp[own] *= target / blended_sum
+        f_own_psf = float(psf_cut[own].sum())
+        if f_own_psf < 1e-8:
+            cut.flag |= Template.FLAG_EXTEND_FAILED
+            cut.flux_beyond_stamp = 0.0
+            return data_f * ext_data
+
+        # Data-anchored PSF model, full stamp: amplitude set by the positive
+        # in-segment flux (positive-pixel core anchor -- IDL's non-detection
+        # treatment), shape by the resampled PSF.
+        A_src = float(np.maximum(data_f[own], 0.0).sum()) / f_own_psf
+        M = A_src * psf_cut
+
+        # Halo weights: one per radial annulus (width = template_blend_annulus,
+        # converted to detection-image pixels via the template WCS), over halo
+        # pixels only (owned background within max_radius_pix).
+        annulus_pix = 4.0
+        if cut.wcs is not None:
+            try:
+                pscale = float(proj_plane_pixel_scales(cut.wcs)[0]) * 3600.0
+                if pscale > 0:
+                    annulus_pix = float(template_blend_annulus) / pscale
+            except Exception:
+                annulus_pix = 4.0
+        if not annulus_pix > 0:
+            annulus_pix = 4.0
+
+        halo_mask = bg_owned & (r2 <= float(max_radius_pix) ** 2)
+        halo_ok = halo_mask & finite  # statistics from finite pixels only
+        bin_idx = (np.sqrt(r2) / annulus_pix).astype(int)
+        if halo_mask.any():
+            n_bins = int(bin_idx[halo_mask].max()) + 1
+            flux_k = np.bincount(bin_idx[halo_ok], weights=img_stamp[halo_ok], minlength=n_bins)[:n_bins]
+            n_k = np.bincount(bin_idx[halo_ok], minlength=n_bins)[:n_bins].astype(float)
+            if ivar_stamp is not None:
+                good = halo_ok & (ivar_stamp > 0)
+                inv_k = np.bincount(bin_idx[good], weights=1.0 / ivar_stamp[good], minlength=n_bins)[:n_bins]
+                good_n_k = np.bincount(bin_idx[good], minlength=n_bins)[:n_bins]
+            else:
+                inv_k = np.zeros(n_bins)
+                good_n_k = np.zeros(n_bins)
+            noise_k = np.where(good_n_k > 0, np.sqrt(inv_k), 0.0)
+            if bg_rms and bg_rms > 0:
+                noise_k = np.where(noise_k > 0, noise_k, bg_rms * np.sqrt(np.maximum(n_k, 0.0)))
+            snr_k = np.zeros(n_bins)
+            has_noise = noise_k > 0
+            snr_k[has_noise] = np.maximum(flux_k[has_noise], 0.0) / noise_k[has_noise]
+            w_k = np.array([blend_weight(s, wings_snr_psf, template_blend_p) for s in snr_k])
+            w_k[n_k <= 0] = 1.0  # empty annulus: no constraint -> inherits the running minimum
+            # Monotone non-increasing outward, seeded at w_core: data trust
+            # never increases with radius, and a faint core caps its halo.
+            w_k = np.minimum.accumulate(np.concatenate(([w_core], w_k)))[1:]
+        else:
+            w_k = np.zeros(0)
+
+        W = np.zeros(img_stamp.shape, dtype=float)
+        W[own] = w_core
+        if halo_mask.any():
+            idx_h = np.clip(bin_idx[halo_mask], 0, len(w_k) - 1)
+            W[halo_mask] = w_k[idx_h]
+        # Halo beyond max_radius_pix but within ee_reach: no data reach, so W
+        # stays at its initialized 0 there -> pure PSF model. Non-finite data
+        # pixels likewise take the model regardless of their annulus weight.
+        W[~finite] = 0.0
+        H = np.where(ext_psf, W * data_f + (1.0 - W) * M, 0.0).astype(cut.data.dtype)
+
+        if w_core < 1.0 or (w_k.size and np.any(w_k < 1.0)):
             cut.flag |= Template.FLAG_PSF_EXTENDED
 
-        # Scaled PSF wings out to the 95% EE radius (IDL :331), anchored on the
-        # positive in-segment flux so noise dips do not drag the amplitude.
-        f_seg_psf = float(psf_cut[own].sum())
-        if f_seg_psf >= 1e-8:
-            anchor = float(np.maximum(comp[own], 0.0).sum())
-            wings = ext_psf & (~own)
-            comp = comp + (anchor / f_seg_psf) * psf_cut * wings
-            cut.flag |= Template.FLAG_PSF_EXTENDED
+        # Per-template truncation bookkeeping (replaces the PSF-EE correction
+        # path in pipeline.py): the model's estimated flux beyond the MODEL
+        # SUPPORT, PSF-extrapolated and core-anchored. f_cut = PSF fraction
+        # inside the support H is actually built over (ext_psf) -- NOT the
+        # whole cutout, which can exceed the support when the PSF reach or
+        # neighbor ownership shrinks it -- so the faint limit Sigma(H) ==
+        # A_src*f_cut holds exactly and apB_corr reproduces the true-total PSF
+        # EE. c_det = detection-PSF stamp containment (docs Sec 5.2) at this
+        # source's sky position; cut.wcs is cutout-frame, so it takes
+        # input_position_cutout (see _lookup_detection_psf).
+        if cut.wcs is not None:
+            ra, dec = cut.wcs.wcs_pix2world(*cut.input_position_cutout, 0)
         else:
-            cut.flag |= Template.FLAG_EXTEND_FAILED
-        return comp
+            ra, dec = cut.position_original
+        c_det = 1.0
+        if isinstance(detection_psf, PSFRegionMap):
+            c_det = detection_psf.get_containment(ra, dec)
+            if not (np.isfinite(c_det) and c_det > 0):
+                c_det = 1.0
+        f_cut = float(psf_cut[ext_psf].sum())
+        cut.flux_beyond_stamp = max(A_src * (1.0 / c_det - f_cut), 0.0)
+
+        return H
 
     def extract_templates(
         self,
@@ -1288,6 +1374,8 @@ class Templates:
         aperture_radius_pix: float | None = None,
         fit_snrlo_psf: float = 0.0,
         wings_snr_psf: float = 3.0,
+        template_blend_p: float = 2.0,
+        template_blend_annulus: float = 0.15,
     ) -> list[Template]:
         """Extract cutout templates around segmentation regions.
 
@@ -1363,6 +1451,8 @@ class Templates:
                     aperture_radius_pix=aperture_radius_pix,
                     fit_snrlo_psf=fit_snrlo_psf, wings_snr_psf=wings_snr_psf,
                     bg_rms=bg_rms, psf_cache=psf_cache,
+                    template_blend_p=template_blend_p,
+                    template_blend_annulus=template_blend_annulus,
                 )
                 cut.data[cut.slices_cutout] = comp.astype(cut.data.dtype)
             else:

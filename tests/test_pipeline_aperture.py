@@ -442,145 +442,154 @@ def test_tcor_lowsnr_psf_kwarg_removed():
         FitConfig(tcor_lowsnr_psf=True)
 
 
-def test_apcor_from_psf_uses_band_native_pixel_scale():
-    """The band-PSF EE (apB) must be measured at the aperture radius in the BAND
-    PSF's NATIVE pixel scale, not the (possibly upsampled) fit-grid r_img_pix.
-    Regression for the upsample-mode grid mismatch that collapsed totcor1 to ~1."""
+def test_truncation_cancels_in_apcor1_survives_in_totcor1():
+    """docs/aperture_corrections.md Sec 5.1/6: the per-source truncation term
+    (from ``flux_beyond_stamp``, the unified template's PSF-extrapolated
+    core-anchored estimate of flux beyond the cutout) cancels exactly in
+    apcor1 (a shape ratio) but survives in totcor1 (aperture-to-total).
+    Replaces the deleted apcor_from_psf PSF-curve-of-growth branch for
+    ``test_apcor_from_psf_uses_band_native_pixel_scale`` /
+    ``..._uses_psf_curve_of_growth`` (that branch, and the band-native-pixel-
+    scale conversion it needed, no longer exist: apB_corr/apF_corr are now a
+    single footprint-truncated fraction times this uniform truncation term
+    for every source)."""
     from mophongo.fit import FitConfig
-    import mophongo.utils as utils
-    n, tn = 25, 25.0; c = n // 2
-    prof = _gauss(n, 2.5)
-    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
-    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
-    orig.snr_seg = 1.0; orig.apcor_from_psf = True
-    psf444 = _gauss(21, 2.0); psf_band = _gauss(21, 3.5)
-    pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
-    pl.psfs = [psf444, psf_band]
-    pl._native_pscale = [0.04, 0.08]           # ref 40 mas, band native 80 mas (upsample x2)
-    cat = Table({"id": [1]})
-    pl._add_aperture_photometry(cat, [conv], np.array([1.0]), np.zeros((n, n)), 1,
-                                r_orig_pix=15.0, orig_templates=[orig])
-    # apB measured at r_band = r_orig * 0.04/0.08 = 7.5 native px (NOT r_img_pix)
-    assert cat["totcor1_1"][0] == pytest.approx(1.0 / utils.psf_ee_at_radius(psf_band, 7.5))
-
-
-def test_apcor_from_psf_uses_psf_curve_of_growth():
-    """apcor_from_psf source: apF/apB come from the PSF curve of growth (utils.
-    psf_ee_at_radius), so totcor1 = 1/EE(PSF_band, r_img). Regression for the
-    module-level utils import used by the PSF path."""
-    from mophongo.fit import FitConfig
-    import mophongo.utils as utils
-    n, tn = 25, 25.0
-    c = n // 2
-    prof = _gauss(n, 2.5)
-    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
-    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
-    orig.snr_seg = 1.0
-    orig.apcor_from_psf = True                      # force the PSF branch
-    psf444 = _gauss(21, 2.0)
-    psf_band = _gauss(21, 3.5)                       # broader band PSF
-    pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
-    pl.psfs = [psf444, psf_band]                     # ndarray PSFs -> _psf_ee ignores ra/dec
-    cat = Table({"id": [1]})
-    pl._add_aperture_photometry(
-        cat, [conv], np.array([1.0]), np.zeros((n, n)), 1,
-        r_orig_pix=5.0, orig_templates=[orig],
-    )
-    r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
-    assert cat["totcor1_1"][0] == pytest.approx(1.0 / utils.psf_ee_at_radius(psf_band, r_img))
-    assert cat["apcor1_1"][0] == pytest.approx(
-        utils.psf_ee_at_radius(psf444, 5.0) / utils.psf_ee_at_radius(psf_band, r_img)
-    )
-
-
-def test_apcor_from_psf_bookkeeping_uses_template_not_psf():
-    """Real-flux bookkeeping (ap_model, ap_flux) must use the fitted template's own
-    aperture fraction, NOT the PSF curve of growth, even for apcor_from_psf sources --
-    regression for the Phase-A bug (docs/aperture_corrections.md Sec 4.2/5.3) that
-    multiplied ap_model by the PSF/template EE ratio. totcor1/apcor1 keep the switched
-    (PSF) behaviour, since those are correction factors, not bookkeeping."""
-    from mophongo.fit import FitConfig
-    import mophongo.utils as utils
     n, tn, fl = 25, 25.0, 3.0
     c = n // 2
-    prof = _gauss(n, 2.5)                       # template profile
+    prof = _gauss(n, 2.5)
+
     conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
     orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
-    orig.snr_seg = 1.0
-    orig.apcor_from_psf = True                  # force the PSF branch for corrections
-    psf444 = _gauss(21, 2.0)
-    psf_band = _gauss(21, 3.5)                  # broader than the template -> EE differs measurably
     pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
-    pl.psfs = [psf444, psf_band]                # ndarray PSFs -> _psf_ee ignores ra/dec
+    pl.psfs = [np.ones((5, 5))]
     cat = Table({"id": [1]})
     residual = np.zeros((n, n))
+    pl._add_aperture_photometry(cat, [conv], np.array([fl]), residual, 1,
+                                r_orig_pix=5.0, orig_templates=[orig])
+    apcor1_notrunc = cat["apcor1_1"][0]
+    totcor1_notrunc = cat["totcor1_1"][0]
 
-    pl._add_aperture_photometry(
-        cat, [conv], np.array([fl]), residual, 1,
-        r_orig_pix=5.0, orig_templates=[orig],
-    )
+    conv2 = Template(prof.copy(), (c, c), (n, n), label=1); conv2.template_norm = tn
+    orig2 = Template(prof.copy(), (c, c), (n, n), label=1); orig2.template_norm = tn
+    orig2.flux_beyond_stamp = 0.5 * tn   # 1/3 of the source's flux lands beyond the cutout
+    cat2 = Table({"id": [1]})
+    pl._add_aperture_photometry(cat2, [conv2], np.array([fl]), residual, 1,
+                                r_orig_pix=5.0, orig_templates=[orig2])
+
+    assert cat2["apcor1_1"][0] == pytest.approx(apcor1_notrunc, rel=1e-10)
+    trunc = tn / (tn + 0.5 * tn)
+    assert cat2["totcor1_1"][0] == pytest.approx(totcor1_notrunc / trunc, rel=1e-10)
+
+
+def test_bookkeeping_invariant_to_truncation_term():
+    """Real-flux bookkeeping (ap_model, ap_flux) must be invariant to
+    flux_beyond_stamp -- the per-source truncation only enters apcor1/totcor1,
+    never ap_model/ap_flux (docs/aperture_corrections.md Sec 4.2/5.1/5.3
+    invariant). Re-targeted from the deleted apcor_from_psf PSF-EE branch: the
+    fitted convolved template's own aperture fraction (apB_book) is now used
+    for ap_model unconditionally, with no PSF-based override to guard against."""
+    from mophongo.fit import FitConfig
+    n, tn, fl = 25, 25.0, 3.0
+    c = n // 2
+    prof = _gauss(n, 2.5)
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
+    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
+    orig.flux_beyond_stamp = 2.0 * tn   # large stamp-edge truncation
+
+    pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
+    pl.psfs = [np.ones((5, 5))]
+    cat = Table({"id": [1]})
+    residual = np.zeros((n, n))
+    pl._add_aperture_photometry(cat, [conv], np.array([fl]), residual, 1,
+                                r_orig_pix=5.0, orig_templates=[orig])
 
     r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
     apB_template = pl._aperture_sum_on_template(conv, r_img)
-    ee_band = utils.psf_ee_at_radius(psf_band, r_img)
-    assert apB_template != pytest.approx(ee_band)  # PSF EE differs measurably from the template fraction
-
-    # Bookkeeping: ap_model/ap_flux use the template's own fraction, NOT the PSF value.
     assert cat["ap_model_1"][0] == pytest.approx(fl * apB_template)
-    assert cat["ap_model_1"][0] != pytest.approx(fl * ee_band)
     assert cat["ap_flux_1"][0] == pytest.approx(cat["ap_model_1"][0] + cat["res_sum_1"][0])
 
-    # Correction factors: totcor1 keeps the PSF curve-of-growth (switched) behaviour.
-    assert cat["totcor1_1"][0] == pytest.approx(1.0 / ee_band)
+    # Correction factor DOES move with the truncation term (contrast with the
+    # untouched bookkeeping above).
+    assert cat["totcor1_1"][0] != pytest.approx(1.0 / apB_template)
 
 
-def test_apcor_from_psf_containment_true_normalizes_totcor1():
-    """PSFRegionMap band PSF with containment=0.9: the stamp-normalized EE must be
-    true-total normalized by multiplying by containment (docs/aperture_corrections.md
-    Sec 4.1/5.2), so totcor1 = 1/(EE_stamp * containment). Real-flux bookkeeping
-    (ap_model) is untouched -- containment enters ONLY the correction side."""
+def test_totcor1_faint_limit_matches_true_total_psf_ee():
+    """Faint/noise-dominated source (in-segment sum clamped to 0 -> w_core == 0;
+    an all-zero halo -> every annulus weight == 0 too), so H == M exactly over
+    the model support. Per docs/aperture_corrections.md Sec 5.1/6's "faint
+    limit check": Sigma(H) == A_src*f_cut and the true total == A_src/c_det,
+    so apB_corr reproduces the Stage-2 true-total PSF EE exactly:
+    totcor1 == 1/(EE(psf, r)*containment). Regression against the (deleted)
+    apcor_from_psf PSF-EE branch's number, now produced by the unified
+    template + truncation term instead.
+
+    The PSF reach (r_reach = 5 px) is deliberately much SMALLER than the
+    41-px stamp, leaving ~13% of the PSF's flux inside the cutout but OUTSIDE
+    the model support: the identity only holds when f_cut is measured over
+    the support H is actually built on (regression for the whole-cutout
+    f_cut bug, which passes the identity only when reach covers the stamp).
+    The measurement aperture (r=3 px) is set inside the reach."""
     import geopandas as gpd
     import shapely.geometry as sgeom
-    from mophongo.fit import FitConfig
+    from mophongo.templates import Templates
     from mophongo.psf_map import PSFRegionMap
     import mophongo.utils as utils
 
-    n, tn, fl = 25, 25.0, 1.0
+    n = 41
     c = n // 2
-    prof = _gauss(n, 2.5)
-    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = tn
-    orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
-    orig.snr_seg = 1.0
-    orig.apcor_from_psf = True                      # force the PSF branch
-    psf444 = _gauss(21, 2.0)
-    psf_band = _gauss(21, 3.5)
-
-    # Single region covering any (ra, dec) the test template resolves to
-    # (orig.wcs is None, so ra_dec == input_position_cutout, a pixel position).
+    psf = _gauss(21, 2.5)   # native detection PSF
     regions = gpd.GeoDataFrame(
         {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
     )
+    prm = PSFRegionMap(regions=regions, psfs=np.array([psf]), containment=0.9)
 
-    def _run(containment):
-        prm_band = PSFRegionMap(regions=regions.copy(), psfs=np.array([psf_band]),
-                                 containment=containment)
-        pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
-        pl.psfs = [psf444, prm_band]                 # band PSF via PSFRegionMap
-        cat = Table({"id": [1]})
-        pl._add_aperture_photometry(
-            cat, [conv], np.array([fl]), np.zeros((n, n)), 1,
-            r_orig_pix=5.0, orig_templates=[orig],
-        )
-        return pl, cat
+    image = np.zeros((n, n))
+    segmap = np.zeros((n, n), dtype=int)
+    segmap[c - 1:c + 2, c - 1:c + 2] = 1
+    # Net-negative in-segment sum (IDL positive-pixel clamp -> snr_seg == 0
+    # exactly), with one positive pixel so A_src stays well-defined.
+    image[c - 1:c + 2, c - 1:c + 2] = -1.0
+    image[c, c] = 3.0
+    ivar = np.ones((n, n))
 
-    pl90, cat90 = _run(0.9)
-    _pl100, cat100 = _run(1.0)
+    r_reach = 5.0   # sigma=2.5 PSF: EE(5) ~ 0.86 -> support excludes real flux
+    tmpls = Templates(min_size=n)
+    tmpls.extract_templates(
+        image, segmap, [(c, c)], extend_mode="auto",
+        detection_psf=prm, detection_weight=ivar,
+        max_radius_pix=r_reach, psf_ee_radius_pix=r_reach,
+        fit_snrlo_psf=10.0, wings_snr_psf=3.0,
+    )
+    orig = tmpls._templates[0]
+    assert orig.snr_seg == 0.0
+    assert orig.flux_beyond_stamp > 0
 
-    r_img = pl90._resolve_image_ap_radius_pix(1, pl90.config)
-    ee_band = utils.psf_ee_at_radius(psf_band, r_img)
-    assert cat90["totcor1_1"][0] == pytest.approx(1.0 / (ee_band * 0.9))
-    # Bookkeeping is bit-identical regardless of containment.
-    assert cat90["ap_model_1"][0] == cat100["ap_model_1"][0]
+    pl = Pipeline([image], segmap)
+    pl.psfs = [np.ones((5, 5))]  # unused: no f444w_aper_col -> tcor_int fallback only
+    pl.config.aperture_diam = 6.0    # r = 3 px, inside the 5-px reach
+    pl.config.aperture_units = "pix"
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(
+        cat, [orig], np.array([1.0]), np.zeros((n, n)), 1,
+        r_orig_pix=5.0, orig_templates=[orig],
+    )
+
+    r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
+    assert r_img == pytest.approx(3.0)
+    expected = 1.0 / (utils.psf_ee_at_radius(psf, r_img) * 0.9)
+    assert cat["totcor1_1"][0] == pytest.approx(expected, rel=1e-6)
+
+
+# NOTE: test_apcor_from_psf_containment_true_normalizes_totcor1 (containment
+# entering totcor1 via a PSFRegionMap band PSF) is gone -- the apB_corr PSF-EE
+# branch it exercised no longer exists (apB_corr is now always apB_book*trunc,
+# and a bare-constructed Template's flux_beyond_stamp defaults to 0, so
+# containment on a hand-built "band PSF" has no path into totcor1 any more).
+# Its regression intent (containment normalizes totcor1 to the true-total PSF
+# EE) is superseded by test_totcor1_faint_limit_matches_true_total_psf_ee
+# above, which exercises containment through the surviving pathway: the
+# DETECTION PSF's containment feeding flux_beyond_stamp in
+# Templates._extended_composite.
 
 
 def test_psf_ee_cache_keys_on_region_not_psf_id():
@@ -588,11 +597,15 @@ def test_psf_ee_cache_keys_on_region_not_psf_id():
     PSFRegionMap.get_psf returns a fresh ndarray view per call and CPython
     reuses freed ids, so an id(psf)-keyed cache collides across regions and
     some sources silently get another region's EE (pre-existing since Phase A).
-    20 sources in 20 regions with distinct band-PSF widths: every totcor1 must
-    match the direct curve-of-growth computation for its OWN region."""
+    Re-targeted from the deleted apB_corr PSF-EE branch to the surviving
+    _psf_ee consumer: the apcor_from_psf Kron-shortcut's ee_kron lookup in
+    _model_kron (docs Sec 5.4). 20 sources in 20 regions with distinct
+    F444W-detection-PSF widths: every tcor_int/f444w_ktot must match the
+    direct curve-of-growth computation for its OWN region."""
     import geopandas as gpd
     import shapely.geometry as sgeom
     from astropy.wcs import WCS
+    from astropy.table import Table as ATable
     from mophongo.fit import FitConfig
     from mophongo.psf_map import PSFRegionMap
     import mophongo.utils as utils
@@ -618,33 +631,45 @@ def test_psf_ee_cache_keys_on_region_not_psf_id():
         conv = Template(img, (x, 12), (n, n), label=i + 1, wcs=w); conv.template_norm = tn
         orig = Template(img, (x, 12), (n, n), label=i + 1, wcs=w); orig.template_norm = tn
         orig.snr_seg = 1.0
-        orig.apcor_from_psf = True                  # force the PSF branch
+        orig.apcor_from_psf = True   # Kron-shortcut path -> deterministic floor circle
         convs.append(conv); origs.append(orig)
 
-    # One region per source (small sky box around it), each with a band PSF of
-    # a distinct width so a cross-region cache hit is detectable.
+    # One region per source (small sky box around it), each with a
+    # F444W-detection PSF of a distinct width so a cross-region cache hit is
+    # detectable.
     half = 15 * 0.04 / 3600.0  # half the 30 px source spacing, in deg
-    boxes, band_psfs = [], []
+    boxes, hires_psfs = [], []
     for i, x in enumerate(xs):
         ra, dec = w.wcs_pix2world(x, 12, 0)
         boxes.append(sgeom.box(float(ra) - half, float(dec) - half,
                                float(ra) + half, float(dec) + half))
-        band_psfs.append(_gauss(21, 1.5 + 0.15 * i))
+        hires_psfs.append(_gauss(21, 1.5 + 0.15 * i))
     regions = gpd.GeoDataFrame({"psf_key": list(range(n_src))}, geometry=boxes, crs=None)
-    prm_band = PSFRegionMap(regions=regions, psfs=np.stack(band_psfs))
+    prm_hires = PSFRegionMap(regions=regions, psfs=np.stack(hires_psfs))
 
-    psf444 = _gauss(21, 2.0)
-    pl = Pipeline([np.zeros((n, W))], np.zeros((n, W)), config=FitConfig())
-    pl.psfs = [psf444, prm_band]
+    # use_aper (arcsec) chosen so r_floor_pix == 5.0 exactly at pscale=0.04
+    # arcsec/px, sidestepping _model_kron's 0.25-px quantization.
+    cat_src = ATable({"id": list(range(1, n_src + 1)), "use_aper": [0.4] * n_src})
+    cfg = FitConfig(f444w_aper_col="use_aper")
+    pl = Pipeline([np.zeros((n, W))], np.zeros((n, W), dtype=int),
+                  catalog=cat_src, wcs=[w], config=cfg)
+    pl.psfs = [prm_hires]
     cat = Table({"id": list(range(1, n_src + 1))})
     pl._add_aperture_photometry(cat, convs, np.ones(n_src), np.zeros((n, W)), 1,
                                 r_orig_pix=5.0, orig_templates=origs)
 
-    r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
-    for i in range(n_src):
-        assert cat["totcor1_1"][i] == pytest.approx(
-            1.0 / utils.psf_ee_at_radius(band_psfs[i], r_img)
-        ), f"source {i}: cached EE came from another region's PSF"
+    pscale_ref = pl._pixel_scale_arcsec(w)
+    r_floor_pix = 0.5 * 0.4 / pscale_ref
+    assert r_floor_pix == pytest.approx(5.0)
+    for i, orig in enumerate(origs):
+        apF_book = pl._aperture_sum_on_template(orig, 5.0)
+        kron_flux_expected = tn * pl._aperture_sum_on_template(orig, r_floor_pix)
+        ee_expected = utils.psf_ee_at_radius(hires_psfs[i], r_floor_pix)
+        f444w_ktot_expected = kron_flux_expected / ee_expected
+        tcor_int_expected = f444w_ktot_expected / (tn * apF_book)
+        assert cat["tcor_int_1"][i] == pytest.approx(tcor_int_expected, rel=1e-6), (
+            f"source {i}: cached EE came from another region's PSF"
+        )
 
 
 def test_residual_segmap_sum_same_res():

@@ -104,27 +104,34 @@ class FitConfig:
     f444w_aper_col: str | None = None
 
     # Template extension beyond the segmap (Estimator-3). Each source's composite
-    # template H is extended beyond the segmentation isophote so the aperture
-    # correction (apcor1 = apF/apB) does not blow up for segmap-truncated sources.
-    # A single "auto" mode chooses per source from its in-segment SNR (snr_seg) and
-    # its owned-wings SNR (snr_wings, integrated out to the measurement aperture):
-    #   FAINT (snr_seg < 1.5*fit_snrlo_psf): blend the core with the detection-PSF
-    #         model in quadrature (-> clean PSF) + PSF wings to the 95% EE radius.
-    #   BRIGHT & EXTENDED (snr_wings > wings_snr_psf): real detection data over the
-    #         source's owned pixels.
-    #   BRIGHT & COMPACT  (snr_wings <= wings_snr_psf): real-data core + PSF wings.
+    # template H is a single radial SNR-weighted linear blend of the real
+    # detection-image data and a data-anchored PSF model M, applied uniformly
+    # over the source's owned stamp (docs/aperture_corrections.md Sec 5.1):
+    #   H = w*data + (1-w)*M, w in [0, 1].
+    # One core weight (the whole segment, from its in-segment SNR) and one
+    # weight per radial halo annulus (from that annulus' own SNR) -- both from
+    # the same ``blend_weight`` onset/rolloff (templates.py), so real data wins
+    # wherever it has SNR and the PSF takes over smoothly wherever it doesn't.
+    # Halo weights are forced monotone non-increasing outward, seeded at the
+    # core weight, so a faint core caps its halo. Onset semantics: the core
+    # weight saturates at 1 for snr_seg >= 1.5*fit_snrlo_psf; each halo
+    # annulus' weight saturates at 1 for its own SNR >= wings_snr_psf.
     # Requires psfs[0]; falls back to truncated templates with a warning if the
     # detection PSF/WCS is absent.
     template_extend_mode: str = "auto"  # "none" | "auto"
-    # Low-SNR PSF prior (IDL fit_snrlo_psf). For a source with in-segment SNR below
-    # 1.5*fit_snrlo_psf the core is blended in quadrature with a detection-PSF model
-    # carrying total SNR ~ fit_snrlo_psf, so faint templates converge to a PSF.
-    # 0 disables the blend.
+    # Core-blend onset (IDL fit_snrlo_psf): the in-segment SNR at which the core
+    # weight saturates at 1 (pure data) is 1.5*fit_snrlo_psf; below that it rolls
+    # off toward the PSF model. 0 disables the core blend (weight pinned at 1).
     fit_snrlo_psf: float = 10.0
-    # Wings-SNR cutoff: below this the wings are extended with the PSF model instead
-    # of real data (compact -> PSF wings; extended -> real data).
+    # Halo-annulus-blend onset: the per-annulus SNR at which that annulus' weight
+    # saturates at 1 (pure data); below that it rolls off toward the PSF model.
     wings_snr_psf: float = 3.0
-    extend_template_ee: float = 0.95  # encircled-energy fraction: PSF-wing reach & max template-size cap
+    # Blend-weight rolloff exponent (templates.blend_weight): w = min(1, (snr/thresh)**p).
+    template_blend_p: float = 2.0
+    # Halo radial-annulus width (arcsec, converted to detection-image pixels via
+    # the template WCS) for the per-annulus SNR/weight measurement.
+    template_blend_annulus: float = 0.15
+    extend_template_ee: float = 0.95  # encircled-energy fraction: PSF reach & max template-size cap
     # --- deprecated PSF-wing extension flags (broken in-place implementation; do not use) ---
     extend_template_segmap: bool = False  # DEPRECATED: old in-place extension, kept False
     extend_template_min_size_margin: float = 1.5  # cutout margin for min_size sizing
