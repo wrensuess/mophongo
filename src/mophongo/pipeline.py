@@ -780,6 +780,25 @@ class Pipeline:
             pscale_img = self._pixel_scale_arcsec(self.wcs[idx] if self.wcs is not None else None)
             r_orig_pix = r_img_pix * pscale_img / pscale_ref if (pscale_img and pscale_ref) else r_img_pix
 
+        # Stage-4b band-side EE radius, in the BAND PSF's NATIVE pixel scale
+        # (constant across sources; computed once). psf_hires (detection) is on
+        # the reference grid so its EE uses r_orig_pix directly, but psf_band is
+        # stored on its native grid; in upsample mode the fit grid overwrites
+        # wcs[idx]=wcs[0], so r_img_pix would be in fine 0.04" fit pixels while
+        # the band PSF is ~0.11"/px native -- measuring band EE at r_img_pix
+        # then samples the wrong physical radius (EE -> ~1, band_det_ratio
+        # inflated, totcor1 depressed for exactly the crowded faint sources
+        # this stage fixes). r_orig_pix is the reference-grid (0.04") aperture
+        # radius in EVERY mode, so converting from it via the captured native
+        # scales (_native_pscale[0]=ref, [idx]=band; commit 716811b Stage-2
+        # pattern) is frame-robust: r_band = r_orig_pix * pscale_ref /
+        # pscale_band. Falls back to r_img_pix when the native scales are
+        # unavailable (WCS-less unit tests / legacy runs).
+        r_band_pix = r_img_pix
+        _psn = getattr(self, "_native_pscale", None)
+        if _psn and len(_psn) > idx and _psn[0] and _psn[idx]:
+            r_band_pix = r_orig_pix * float(_psn[0]) / float(_psn[idx])
+
         # Stage-3b catalog color-aperture floor (docs Sec 5.4; same per-source
         # ingestion idiom as the deleted rung-1 low-SNR blend, commit 91c96d0):
         # r_floor_pix = 0.5 * catalog[f444w_aper_col] / pscale_ref, on the
@@ -858,7 +877,7 @@ class Pipeline:
         psf_hires = self.psfs[0] if (self.psfs is not None and len(self.psfs) > 0) else None
         _ee_cache: dict = {}
 
-        def _psf_ee(psfmap, ra, dec, radius):
+        def _psf_ee(psfmap, ra, dec, radius, *, with_containment: bool = True):
             if psfmap is None:
                 return None
             # Cache key: (psfmap identity, region, radius) -- NOT id(psf):
@@ -877,17 +896,37 @@ class Pipeline:
                 containment = 1.0
             if psf is None:
                 return None
-            key = (id(psfmap), region, float(radius))
+            # with_containment is part of the key: Stage-4b's band-side stamp-
+            # EE ratio (docs Sec 5.1/6) needs the RAW stamp EE, not the
+            # true-total one tcor_int's ee_kron lookup uses -- same cache,
+            # two independent entries so neither call site's value is stale.
+            key = (id(psfmap), region, float(radius), with_containment)
             if key not in _ee_cache:
                 try:
                     # True-total normalization (docs/aperture_corrections.md
                     # Sec 4.1/5.2): psf_ee_at_radius is stamp-normalized, so
                     # multiply by the region's containment (fraction of the
                     # PSF's true total flux in the stamp). ndarray PSFs -> 1.0.
-                    _ee_cache[key] = utils.psf_ee_at_radius(psf, radius) * containment
+                    val = utils.psf_ee_at_radius(psf, radius)
+                    _ee_cache[key] = val * containment if with_containment else val
                 except Exception:  # pragma: no cover - degenerate PSF
                     _ee_cache[key] = None
             return _ee_cache[key]
+
+        def _psf_containment(psfmap, ra, dec):
+            """Per-region PSF stamp containment alone (docs Sec 5.2), 1.0
+            default for a non-PSFRegionMap/unset containment -- mirrors
+            _psf_ee's containment handling (loud warning already emitted at
+            PSFRegionMap load time, not here). Feeds the Stage-4b band-side
+            c_b/c_det factor (ruling Sec "Ruling"), which is evaluated fresh
+            from self.psfs[0]/self.psfs[idx] here -- independent of whatever
+            detection_psf was passed to Templates.extract_templates -- so the
+            two agree in a real run (same PSFRegionMap object) without coupling
+            this method to the extraction call site."""
+            if isinstance(psfmap, PSFRegionMap):
+                c = psfmap.get_containment(ra, dec)
+                return float(c) if (np.isfinite(c) and c > 0) else 1.0
+            return 1.0
 
         # Accumulate the model aperture flux per parent id (multi-component
         # templates share an id); the correction factors and the residual are
@@ -956,8 +995,40 @@ class Pipeline:
             flux_beyond = float(getattr(orig_t, "flux_beyond_stamp", 0.0) or 0.0)
             trunc_denom = template_norm_i + flux_beyond
             trunc = template_norm_i / trunc_denom if trunc_denom > 0 else 1.0
-            apB_corr = apB_book * trunc
-            apF_corr = apF_book * trunc
+
+            # Stage-4b (docs Sec 5.1/6, ruling "A+cb"): correction-only
+            # crowding delta -- PSF flux the fit's own support excluded
+            # (neighbour territory and/or beyond ee_reach) that is still the
+            # source's own light. Sigma(H_corr) + fb_corr telescopes to the
+            # SAME trunc_denom above (the full-stamp PSF piece cancels
+            # algebraically), so only the APERTURE-SUM numerators change here.
+            # flux_beyond_aper (set in _extended_composite, detection frame,
+            # a per-template scalar) is reshaped to band space via the
+            # per-region stamp-EE ratio below rather than a per-source band
+            # convolution (ruling Sec "risks" item 5: the matching kernel
+            # maps the detection PSF onto the band PSF by construction).
+            flux_beyond_aper = float(getattr(orig_t, "flux_beyond_aper", 0.0) or 0.0)
+            c_det = _psf_containment(psf_hires, ra_dec[0], ra_dec[1])
+            band_psf = self.psfs[idx] if (self.psfs is not None and idx < len(self.psfs)) else None
+            c_b = _psf_containment(band_psf, ra_dec[0], ra_dec[1])
+            # Band EE at r_band_pix (band NATIVE grid, converted above); the
+            # detection EE stays at r_orig_pix (reference grid, already correct).
+            ee_band_stamp = _psf_ee(band_psf, ra_dec[0], ra_dec[1], r_band_pix, with_containment=False)
+            ee_det_stamp = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_orig_pix, with_containment=False)
+            band_det_ratio = (
+                ee_band_stamp / ee_det_stamp
+                if (ee_band_stamp is not None and ee_det_stamp) else 1.0
+            )
+            flux_beyond_aper_band = flux_beyond_aper * band_det_ratio
+
+            apF_corr = apF_book * trunc + (flux_beyond_aper / trunc_denom if trunc_denom > 0 else 0.0)
+            apB_corr_book = apB_book * trunc + (flux_beyond_aper_band / trunc_denom if trunc_denom > 0 else 0.0)
+            # Band side ONLY (ruling): the stamp-built kernel maps the
+            # c_det-truncated detection PSF onto the c_b-truncated band PSF,
+            # so the model's band-aperture flux is high by c_det/c_b -- the
+            # detection side needs no such factor (flux_beyond_aper above
+            # already true-normalizes it via c_det, embedded in trunc_denom).
+            apB_corr = apB_corr_book * (c_b / c_det) if c_det > 0 else apB_corr_book
 
             # Real-unit template aperture fluxes (template_norm restores image
             # flux units; it cancels in apcor1 but is required so tcor_int and
@@ -966,8 +1037,10 @@ class Pipeline:
             ap_f_corr = template_norm_i * apF_corr if apF_corr > 0 else 0.0  # high-res template flux in aperture
 
             # Shape correction: high-res / low-res aperture flux (real units).
-            # trunc cancels exactly (apcor1 == apF_book/apB_book): a shape ratio
-            # is invariant to the source's total-flux truncation.
+            # trunc cancels exactly (both apF_corr and apB_corr share the same
+            # trunc factor); the c_b/c_det band factor deliberately does NOT
+            # (ruling: apcor1 gains x c_det/c_b -- a genuine shape effect of
+            # the stamp-containment mismatch between the two PSFs).
             apcor1 = ap_f_corr / ap_b_corr if (ap_b_corr > 0 and ap_f_corr > 0) else 1.0
             # Internal aperture-to-total (design-doc Eq. 7; = IDL totcor). trunc
             # survives here (aperture-to-TOTAL, not a shape ratio).
@@ -1228,6 +1301,24 @@ class Pipeline:
                 elif scalar_ap and config.aperture_units == "pix":
                     # aperture already in detection-grid pixels
                     r_orig = 0.5 * float(config.aperture_diam)
+
+                # Stage-4b crowding correction requires a scalar detection-grid
+                # aperture radius (aperture_radius_pix below): flux_beyond_aper
+                # is a per-source SCALAR keyed to one aperture, so a per-band
+                # aperture_diam ARRAY (scalar_ap False -> r_orig None ->
+                # aperture_radius_pix None) leaves flux_beyond_aper == 0 for
+                # every source, silently reverting the correction to Stage-4
+                # behavior. Warn loudly (default-off features must not fail
+                # silently) -- fluxes are still valid, just without the crowding
+                # aperture-to-total fix.
+                if r_orig is None and not scalar_ap:
+                    logger.warning(
+                        "aperture_diam is a per-band array: the Stage-4b crowding "
+                        "correction (docs/aperture_corrections.md Sec 5.1/6) is "
+                        "DISABLED (flux_beyond_aper == 0 for every source, totcor1/"
+                        "apcor1 revert to the Stage-4 masked-support values). Use a "
+                        "scalar aperture_diam to enable it."
+                    )
 
                 # Largest matching-kernel EFFECTIVE half-width across the fitted
                 # bands (the 95% encircled radius of |K|, NOT the zero-padded

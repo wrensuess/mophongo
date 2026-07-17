@@ -8,6 +8,7 @@ import numpy as np
 from astropy.nddata import Cutout2D
 from astropy.wcs import WCS
 from photutils.segmentation import SegmentationImage
+from photutils.aperture import CircularAperture
 from tqdm import tqdm
 from scipy.signal import fftconvolve
 from scipy.interpolate import interp1d
@@ -458,6 +459,14 @@ class Template(Cutout2D):
         # core-anchored model (set in _extended_composite). 0.0 when extension is
         # disabled/failed (fully footprint-truncated template).
         self.flux_beyond_stamp: float = 0.0
+        # Correction-only crowding delta (docs/aperture_corrections.md Sec
+        # 5.1/6, Stage-4b "A+cb"): the source's own PSF-model flux inside the
+        # measurement aperture but OUTSIDE the fit support (own/bg_owned
+        # territory a close neighbour's ownership boundary excluded, or
+        # beyond ee_reach) -- real flux units, detection-frame aperture
+        # radius, set in _extended_composite. 0.0 when extension is
+        # disabled/failed or no aperture radius was supplied at extraction.
+        self.flux_beyond_aper: float = 0.0
         self.err = 0.0
         self.err_pred = 0.0  # predicted error from weight map and profile
         self.wnorm = 0.0  # weighted norm of the template d * w * d
@@ -1258,6 +1267,7 @@ class Templates:
         if psf_src is None or psf_src.sum() <= 0:
             cut.flag |= Template.FLAG_EXTEND_FAILED
             cut.flux_beyond_stamp = 0.0
+            cut.flux_beyond_aper = 0.0
             return data_f * ext_data  # fall back to real-data extension
 
         psf_total = float(psf_src.sum())
@@ -1271,6 +1281,7 @@ class Templates:
         if f_own_psf < 1e-8:
             cut.flag |= Template.FLAG_EXTEND_FAILED
             cut.flux_beyond_stamp = 0.0
+            cut.flux_beyond_aper = 0.0
             return data_f * ext_data
 
         # Data-anchored PSF model, full stamp: amplitude set by the positive
@@ -1356,6 +1367,38 @@ class Templates:
                 c_det = 1.0
         f_cut = float(psf_cut[ext_psf].sum())
         cut.flux_beyond_stamp = max(A_src * (1.0 / c_det - f_cut), 0.0)
+
+        # Stage-4b correction-only crowding delta (docs Sec 5.1/6, ruling
+        # "A+cb"): a close neighbour's ownership boundary can truncate
+        # ext_psf well INSIDE the measurement aperture, in which case H is
+        # identically zero there even though the source's own PSF tail
+        # genuinely extends into that (neighbour-owned) territory. Since H is
+        # zero everywhere outside ext_psf by construction (regardless of the
+        # data/PSF blend inside it), H_corr - H == A_src*psf_cut there
+        # EXACTLY -- not an approximation. The delta is the aperture sum of
+        # psf_cut restricted to OUTSIDE ext_psf. Stored as a per-template
+        # SCALAR in real-flux units (never the full psf_cut array -- MEMORY,
+        # ~340k sources); the band-frame equivalent is reshaped from this
+        # scalar via a per-region stamp-EE ratio in pipeline.py rather than a
+        # per-source band convolution. RUNTIME: (1) fast bounding-box
+        # pre-check -- for the common isolated case ext_psf already covers the
+        # full aperture disk (own+halo reach to ee_reach >= aperture_radius_pix
+        # in every direction), so the exact-overlap computation is skipped
+        # whenever the aperture's bounding box has no outside-ext_psf pixel at
+        # all; (2) ``aper.to_mask().multiply()`` instead of
+        # ``aperture_photometry()`` -- the identical exact-overlap sum without
+        # photutils' QTable construction overhead, ~20x faster per call (the
+        # dominant cost of this correction at 340k sources).
+        cut.flux_beyond_aper = 0.0
+        if aperture_radius_pix is not None and aperture_radius_pix > 0:
+            r_ap = float(aperture_radius_pix)
+            y0, y1 = max(int(np.floor(ys - r_ap)), 0), min(int(np.ceil(ys + r_ap)) + 1, h)
+            x0, x1 = max(int(np.floor(xs - r_ap)), 0), min(int(np.ceil(xs + r_ap)) + 1, w)
+            if (~ext_psf[y0:y1, x0:x1]).any():
+                aper = CircularAperture((xs, ys), r=r_ap)
+                overlap = aper.to_mask(method="exact").multiply(psf_cut * ~ext_psf)
+                delta = float(overlap.sum()) if overlap is not None else 0.0
+                cut.flux_beyond_aper = max(A_src * delta, 0.0)
 
         return H
 

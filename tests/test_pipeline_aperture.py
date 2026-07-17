@@ -452,7 +452,13 @@ def test_truncation_cancels_in_apcor1_survives_in_totcor1():
     ``..._uses_psf_curve_of_growth`` (that branch, and the band-native-pixel-
     scale conversion it needed, no longer exist: apB_corr/apF_corr are now a
     single footprint-truncated fraction times this uniform truncation term
-    for every source)."""
+    for every source).
+
+    Stage-4b (ruling "A+cb"): reworked rather than deleted per the brief --
+    the SAME truncation-cancellation invariant above still holds exactly, but
+    now a SECOND, deliberately non-cancelling factor exists too: the band-side
+    containment ratio c_b/c_det (docs Sec 5.1/6). Asserted here explicitly so
+    the two invariants (trunc cancels; c_b/c_det does not) are never conflated."""
     from mophongo.fit import FitConfig
     n, tn, fl = 25, 25.0, 3.0
     c = n // 2
@@ -462,6 +468,10 @@ def test_truncation_cancels_in_apcor1_survives_in_totcor1():
     orig = Template(prof.copy(), (c, c), (n, n), label=1); orig.template_norm = tn
     pl = Pipeline([np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
     pl.psfs = [np.ones((5, 5))]
+    # Fixed r_img_pix=5.0 (matches r_orig_pix below and the pl3 block further
+    # down) so all three sub-comparisons in this test share one aperture radius.
+    pl.config.aperture_diam = 10.0
+    pl.config.aperture_units = "pix"
     cat = Table({"id": [1]})
     residual = np.zeros((n, n))
     pl._add_aperture_photometry(cat, [conv], np.array([fl]), residual, 1,
@@ -479,6 +489,32 @@ def test_truncation_cancels_in_apcor1_survives_in_totcor1():
     assert cat2["apcor1_1"][0] == pytest.approx(apcor1_notrunc, rel=1e-10)
     trunc = tn / (tn + 0.5 * tn)
     assert cat2["totcor1_1"][0] == pytest.approx(totcor1_notrunc / trunc, rel=1e-10)
+
+    # Stage-4b: introduce a genuine c_det != c_b (both psfs[0]/psfs[1] real
+    # PSFRegionMaps with distinct containments; same conv/orig/trunc as the
+    # apcor1_notrunc case above) -- apcor1 must gain EXACTLY c_det/c_b, not
+    # cancel like trunc does.
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.psf_map import PSFRegionMap
+
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+    c_det, c_b = 0.9622, 0.9192
+    prm_det = PSFRegionMap(regions=regions, psfs=np.array([_gauss(21, 2.0)]), containment=c_det)
+    prm_band = PSFRegionMap(regions=regions, psfs=np.array([_gauss(21, 2.0)]), containment=c_b)
+
+    conv3 = Template(prof.copy(), (c, c), (n, n), label=1); conv3.template_norm = tn
+    orig3 = Template(prof.copy(), (c, c), (n, n), label=1); orig3.template_norm = tn
+    pl3 = Pipeline([np.zeros((n, n)), np.zeros((n, n))], np.zeros((n, n)), config=FitConfig())
+    pl3.psfs = [prm_det, prm_band]
+    pl3.config.aperture_diam = 10.0
+    pl3.config.aperture_units = "pix"
+    cat3 = Table({"id": [1]})
+    pl3._add_aperture_photometry(cat3, [conv3], np.array([fl]), residual, 1,
+                                 r_orig_pix=5.0, orig_templates=[orig3])
+    assert cat3["apcor1_1"][0] == pytest.approx(apcor1_notrunc * (c_det / c_b), rel=1e-10)
 
 
 def test_bookkeeping_invariant_to_truncation_term():
@@ -670,6 +706,417 @@ def test_psf_ee_cache_keys_on_region_not_psf_id():
         assert cat["tcor_int_1"][i] == pytest.approx(tcor_int_expected, rel=1e-6), (
             f"source {i}: cached EE came from another region's PSF"
         )
+
+
+# --- Stage-4b: corrections on the partially-unmasked model + band containment
+# factor (docs/aperture_corrections.md Sec 5.1/6, ruling "A+cb") -----------
+
+def _two_band_faint_scene(n=81, r_ap=6.0, ee_reach=25.0, sigma_d=2.0, sigma_b=3.2,
+                          c_det=0.9622, c_b=0.9192):
+    """Isolated, net-negative (pure-noise) faint source with a REAL matching
+    kernel between a narrower detection PSF and a wider band PSF, and two
+    PSFRegionMaps carrying distinct containments -- the scene acceptance
+    tests 1 and 5 share (docs Sec 5.1/6, ruling "A+cb"). Returns
+    ``(cat, pl, r_img, r_ap, psf_det, psf_band)``.
+    """
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.templates import Templates
+    from mophongo.psf_map import PSFRegionMap
+    from mophongo.psf import PSF
+
+    c = n // 2
+    psf_det = _gauss(41, sigma_d)
+    psf_band = _gauss(41, sigma_b)
+    # Real Fourier-domain matching kernel (mophongo.psf.matching_kernel --
+    # Tukey-windowed, the actual production machinery), so detection_PSF (x) K
+    # genuinely reproduces the band PSF rather than an idealized assumption.
+    kernel = PSF.from_array(psf_det).matching_kernel(psf_band)
+
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+    prm_det = PSFRegionMap(regions=regions, psfs=np.array([psf_det]), containment=c_det)
+    prm_band = PSFRegionMap(regions=regions, psfs=np.array([psf_band]), containment=c_b)
+
+    image = np.zeros((n, n))
+    segmap = np.zeros((n, n), dtype=int)
+    segmap[c - 1:c + 2, c - 1:c + 2] = 1
+    # Net-negative in-segment sum (IDL positive-pixel clamp -> snr_seg == 0
+    # exactly -> w_core == 0, H == M everywhere), one positive pixel so A_src
+    # stays well-defined -- same faint-limit construction as
+    # test_totcor1_faint_limit_matches_true_total_psf_ee, extended to two bands.
+    image[c - 1:c + 2, c - 1:c + 2] = -1.0
+    image[c, c] = 3.0
+    ivar = np.ones((n, n))
+
+    tmpls = Templates(min_size=n)
+    tmpls.extract_templates(
+        image, segmap, [(c, c)], extend_mode="auto",
+        detection_psf=prm_det, detection_weight=ivar,
+        max_radius_pix=ee_reach, psf_ee_radius_pix=ee_reach,
+        aperture_radius_pix=r_ap,
+        fit_snrlo_psf=10.0, wings_snr_psf=3.0,
+    )
+    orig = tmpls._templates[0]
+    assert orig.snr_seg == 0.0
+    assert orig.flux_beyond_aper == pytest.approx(0.0)  # isolated: r_ap fully inside ee_reach
+
+    conv = tmpls.convolve_templates(kernel, inplace=False)[0]
+
+    pl = Pipeline([image, image], segmap)
+    pl.psfs = [prm_det, prm_band]
+    pl.config.aperture_diam = 2 * r_ap
+    pl.config.aperture_units = "pix"
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(
+        cat, [conv], np.array([1.0]), np.zeros((n, n)), 1,
+        r_orig_pix=r_ap, orig_templates=[orig],
+    )
+    r_img = pl._resolve_image_ap_radius_pix(1, pl.config)
+    return cat, pl, r_img, r_ap, psf_det, psf_band
+
+
+def test_totcor1_two_band_faint_limit_matches_true_total_psf_ee():
+    """Acceptance test 1 (Stage-4b ruling): the two-band generalization of
+    ``test_totcor1_faint_limit_matches_true_total_psf_ee`` (which stays,
+    single-band/K=identity). With a genuinely wider band PSF, a real
+    (non-identity) matching kernel, and DISTINCT detection/band containments,
+    the faint (pure-noise) limit must reproduce
+    totcor1 == 1/(EE_band_stamp(r_ap) * c_b) -- the band-side containment
+    factor, NOT c_det (root cause 1 fixed for the band-frame stamp-vs-band
+    containment mismatch, docs Sec 5.1/6). apF_corr (detection side) gets NO
+    such factor: it stays the Stage-4 true-total form EE_det_stamp(r_color)*c_det."""
+    import mophongo.utils as utils
+
+    c_det, c_b = 0.9622, 0.9192
+    cat, pl, r_img, r_ap, psf_det, psf_band = _two_band_faint_scene(c_det=c_det, c_b=c_b)
+
+    totcor1 = cat["totcor1_1"][0]
+    expected_totcor1 = 1.0 / (utils.psf_ee_at_radius(psf_band, r_img) * c_b)
+    assert totcor1 == pytest.approx(expected_totcor1, rel=2e-3)
+
+    # apF_corr isn't a written column; recover it algebraically from the two
+    # that are (apcor1 = apF_corr/apB_corr, totcor1 = 1/apB_corr, so
+    # apF_corr = apcor1/totcor1).
+    apF_corr = cat["apcor1_1"][0] / cat["totcor1_1"][0]
+    expected_apF_corr = utils.psf_ee_at_radius(psf_det, r_ap) * c_det
+    assert apF_corr == pytest.approx(expected_apF_corr, rel=1e-6)
+
+
+def test_apcor1_gains_band_containment_ratio():
+    """Acceptance test 5 (Stage-4b ruling): the band containment factor must
+    NOT cancel in apcor1 -- it multiplies apcor1 by c_det/c_b, a genuine shape
+    effect of the stamp-containment mismatch between the detection and band
+    PSFs (contrast with trunc, which DOES cancel --
+    test_truncation_cancels_in_apcor1_survives_in_totcor1)."""
+    import mophongo.utils as utils
+
+    c_det, c_b = 0.9622, 0.9192
+    cat, pl, r_img, r_ap, psf_det, psf_band = _two_band_faint_scene(c_det=c_det, c_b=c_b)
+
+    apcor1 = cat["apcor1_1"][0]
+    expected = (
+        (utils.psf_ee_at_radius(psf_det, r_ap) * c_det)
+        / (utils.psf_ee_at_radius(psf_band, r_img) * c_b)
+    )
+    assert apcor1 == pytest.approx(expected, rel=2e-3)
+
+
+def test_asrc_invariance_of_totcor1_with_data_core_and_crowded_wings():
+    """Acceptance test 2 (Stage-4b ruling): totcor1 evaluated on the corrected
+    model is invariant to the positive-clip amplitude A_src of the PSF-wing
+    component -- inflating A_src (e.g. from neighbour-wing light or clipped
+    noise, docs Sec "risks"/ruling diagnosis) slides the wing toward the
+    pure-PSF limit without moving totcor1, because Sigma(H_corr)+fb_corr and
+    the aperture-sum numerator both scale the SAME way with A_src. This is
+    the property that kills the crowded tail (a masked-Sigma(H) vs
+    unmasked-fb mismatch inflates totcor1 with A_src on unfixed Stage-4 code).
+
+    Construction: a FIXED, real bright compact data core (not PSF-scaled) plus
+    PSF wings of amplitude A_src, crowded so the wings are cut off on one side
+    well inside the aperture (own territory only spans half the aperture
+    disk) -- this is exactly the "data core (w_core~1) + noise-floor wings
+    (w_k~0)" regime the ruling's diagnosis describes for the real MIRI-faint
+    population (snr_seg measured on deep F444W keeps w_core~1 while the owned
+    halo is noise-dominated, w_k~0). template_norm/flux_beyond_stamp differ by
+    ~5x between the two A_src values (materially), yet totcor1 must agree to
+    <=1% (vs >2% on unfixed Stage-4 code for the same construction)."""
+    from photutils.aperture import CircularAperture, aperture_photometry
+
+    n = 61
+    c = n // 2
+    r_ap = 6.0
+    ee_reach = 15.0
+    c_det = 0.95
+
+    yy, xx = np.mgrid[0:n, 0:n]
+    r2 = (xx - c) ** 2 + (yy - c) ** 2
+    psf_cut = _gauss(n, 2.0)  # unit-sum "own stamp" detection PSF, resampled
+
+    own = r2 <= 2.0 ** 2  # tiny bright compact core (r<=2)
+    halo = (~own) & (r2 <= ee_reach ** 2)
+    # Crowding: a neighbour on the x>c side claims that half of the halo, so
+    # the fit support (ext_psf) excludes it even though it is within ee_reach.
+    ext_psf = own | (halo & (xx <= c))
+
+    # Real, FIXED bright compact core (not PSF-scaled): a raw (PEAK, not
+    # unit-sum) amplitude=50 Gaussian, so the core's total flux genuinely
+    # dominates over the modest A_src wing amplitudes tried below.
+    data_core = 50.0 * np.exp(-r2 / (2 * 1.3 ** 2)) * own
+
+    f_cut_support = float(psf_cut[ext_psf].sum())
+    aper = CircularAperture((c, c), r=r_ap)
+    aper_full = float(aperture_photometry(psf_cut, aper, method="exact")["aperture_sum"][0])
+    ext_arr = psf_cut * ext_psf
+    aper_ext = float(aperture_photometry(ext_arr, aper, method="exact")["aperture_sum"][0])
+
+    def build(A_src):
+        # W==1 in own (data core), W==0 in the halo (pure PSF wings) -- the
+        # "bright compact" limit (docs Sec 2.1), zero outside ext_psf by
+        # construction (own is a subset of ext_psf).
+        H = data_core + A_src * psf_cut * (ext_psf & ~own)
+        H = np.where(ext_psf, H, 0.0)
+        template_norm = float(H.sum())
+        flux_beyond_stamp = max(A_src * (1.0 / c_det - f_cut_support), 0.0)
+        flux_beyond_aper = max(A_src * (aper_full - aper_ext), 0.0)
+        unit = H / template_norm
+        orig = Template(unit.copy(), (c, c), (n, n), label=1)
+        orig.template_norm = template_norm
+        orig.flux_beyond_stamp = flux_beyond_stamp
+        orig.flux_beyond_aper = flux_beyond_aper
+        conv = Template(unit.copy(), (c, c), (n, n), label=1)
+        conv.template_norm = template_norm
+        return orig, conv, template_norm, flux_beyond_stamp
+
+    results = {}
+    for A_src in (5.0, 30.0):
+        orig, conv, tn, fb = build(A_src)
+        pl = Pipeline([np.zeros((n, n))], np.zeros((n, n), dtype=int))
+        pl.psfs = [np.ones((5, 5))]  # containment fallback 1.0 both sides -- isolates the delta
+        pl.config.aperture_diam = 2 * r_ap
+        pl.config.aperture_units = "pix"
+        cat = Table({"id": [1]})
+        pl._add_aperture_photometry(cat, [conv], np.array([1.0]), np.zeros((n, n)), 1,
+                                    r_orig_pix=r_ap, orig_templates=[orig])
+        results[A_src] = dict(tn=tn, fb=fb, totcor1=cat["totcor1_1"][0])
+
+    # template_norm/flux_beyond_stamp differ materially (>3x) between the two
+    # A_src values...
+    assert results[30.0]["tn"] / results[5.0]["tn"] > 1.02
+    assert results[30.0]["fb"] / results[5.0]["fb"] > 3.0
+    # ...yet totcor1 (the corrected aperture-to-total) agrees to <=1%.
+    t5, t30 = results[5.0]["totcor1"], results[30.0]["totcor1"]
+    assert abs(t30 - t5) / t5 <= 0.01
+
+
+def test_crowding_regression_totcor1_matches_isolated():
+    """Acceptance test 3 (Stage-4b ruling): a faint source plus a 40x brighter
+    neighbour ~15-25 px away must give totcor1 within 3% of the SAME source
+    measured in isolation (real two-segment ownership machinery, i.e. the
+    genuine ``Templates._build_ownership`` area contest, not a hand-built
+    mask). On unfixed Stage-4 code the SAME construction inflates totcor1 by
+    ~1.6x (docs Sec 4.3's diagnosed tail; ruling table)."""
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.templates import Templates
+    from mophongo.psf_map import PSFRegionMap
+
+    n = 121
+    sigma = 2.0
+    psf = _gauss(41, sigma)
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+    prm = PSFRegionMap(regions=regions, psfs=np.array([psf]), containment=0.95)
+    r_ap = 5.0
+    ee_reach = 20.0
+    ty, tx = 60, 40
+
+    def run_scene(sep):
+        image = np.zeros((n, n))
+        segmap = np.zeros((n, n), dtype=int)
+        segmap[ty - 1:ty + 2, tx - 1:tx + 2] = 1  # faint target: net-negative 3x3 segment
+        image[ty - 1:ty + 2, tx - 1:tx + 2] = -1.0
+        image[ty, tx] = 3.0
+        ivar = np.ones((n, n))
+        positions = [(tx, ty)]
+        if sep is not None:
+            nb = _gauss(n, 3.0) * (40 * 3.0 * (2 * np.pi * 3.0 ** 2))  # 40x brighter peak
+            image += nb
+            segmap[nb > nb.max() * np.exp(-0.5)] = 2  # ~1-sigma isophote segment
+            positions.append((tx + sep, ty))
+
+        tmpls = Templates(min_size=n)
+        tmpls.extract_templates(
+            image, segmap, positions, extend_mode="auto",
+            detection_psf=prm, detection_weight=ivar,
+            max_radius_pix=ee_reach, psf_ee_radius_pix=ee_reach,
+            aperture_radius_pix=r_ap,
+            fit_snrlo_psf=10.0, wings_snr_psf=3.0,
+        )
+        orig = tmpls._templates[0]
+        assert orig.snr_seg == 0.0
+
+        pl = Pipeline([image], segmap)
+        pl.psfs = [prm]
+        pl.config.aperture_diam = 2 * r_ap
+        pl.config.aperture_units = "pix"
+        cat = Table({"id": [1]})
+        pl._add_aperture_photometry(cat, [orig], np.array([1.0]), np.zeros((n, n)), 1,
+                                    r_orig_pix=r_ap, orig_templates=[orig])
+        return cat["totcor1_1"][0]
+
+    totcor1_iso = run_scene(None)
+    for sep in (15, 20, 25):
+        totcor1_crowded = run_scene(sep)
+        assert totcor1_crowded == pytest.approx(totcor1_iso, rel=0.03), (
+            f"sep={sep}: crowded totcor1 {totcor1_crowded} vs isolated {totcor1_iso}"
+        )
+
+
+def test_fit_invariant_to_containment_perturbation():
+    """Acceptance test 4 (Stage-4b ruling): perturbing the containments that
+    feed the band-side c_b/c_det factor must leave the FIT-side bookkeeping
+    (ap_model, ap_flux, res_sum -- and, by construction, the fitted flux_1
+    that feeds them, unchanged here since the same ``fluxes`` array is reused)
+    bit-identical; only totcor1/apcor1 (and, downstream, apcor/tcor_int/est3*,
+    which are algebraic functions of apcor1/totcor1) move."""
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.templates import Templates
+    from mophongo.psf_map import PSFRegionMap
+
+    n = 61
+    c = n // 2
+    psf = _gauss(31, 2.0)
+    r_ap = 5.0
+    ee_reach = 18.0
+
+    image = np.zeros((n, n))
+    segmap = np.zeros((n, n), dtype=int)
+    segmap[c - 1:c + 2, c - 1:c + 2] = 1
+    image[c - 1:c + 2, c - 1:c + 2] = -1.0
+    image[c, c] = 3.0
+    ivar = np.ones((n, n))
+
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+    prm_extract = PSFRegionMap(regions=regions, psfs=np.array([psf]), containment=0.9622)
+    tmpls = Templates(min_size=n)
+    tmpls.extract_templates(
+        image, segmap, [(c, c)], extend_mode="auto",
+        detection_psf=prm_extract, detection_weight=ivar,
+        max_radius_pix=ee_reach, psf_ee_radius_pix=ee_reach,
+        aperture_radius_pix=r_ap,
+        fit_snrlo_psf=10.0, wings_snr_psf=3.0,
+    )
+    orig = tmpls._templates[0]
+
+    rows = {}
+    for c_det_ratio in (0.9622, 1.0):
+        prm_ratio = PSFRegionMap(regions=regions, psfs=np.array([psf]), containment=c_det_ratio)
+        pl = Pipeline([image], segmap)
+        pl.psfs = [prm_ratio]  # only self.psfs[0] (c_det) perturbed; SAME fluxes/templates
+        pl.config.aperture_diam = 2 * r_ap
+        pl.config.aperture_units = "pix"
+        cat = Table({"id": [1]})
+        pl._add_aperture_photometry(cat, [orig], np.array([1.0]), np.zeros((n, n)), 1,
+                                    r_orig_pix=r_ap, orig_templates=[orig])
+        rows[c_det_ratio] = dict(cat[0])
+
+    a, b = rows[0.9622], rows[1.0]
+    for col in ("ap_model_1", "ap_flux_1", "res_sum_1"):
+        assert a[col] == b[col], f"{col} must be bit-identical under a containment perturbation"
+    assert a["totcor1_1"] != pytest.approx(b["totcor1_1"])
+    assert a["apcor1_1"] != pytest.approx(b["apcor1_1"])
+
+
+def test_band_ee_uses_native_pixel_scale_not_fit_grid():
+    """Stage-4b BLOCKING fix: the band-side EE (band_det_ratio) must be
+    evaluated on the band PSF's NATIVE pixel grid, not the (possibly upsampled)
+    fit grid. In the default multi_resolution_method='upsample' path, the fit
+    loop rewrites wcs[idx]=wcs[0], so r_img_pix ends up in fine detection
+    pixels (~0.04\") while self.psfs[idx] is stored on its coarse native grid
+    (~0.11\"/px); measuring the band EE at the fine radius samples the wrong
+    physical radius (EE -> ~1), inflating band_det_ratio, overestimating
+    flux_beyond_aper_band and depressing totcor1 for exactly the crowded faint
+    sources this stage fixes. The pipeline converts via the captured
+    ``self._native_pscale`` (commit 716811b Stage-2 pattern):
+    r_band = r_orig_pix * _native_pscale[0] / _native_pscale[idx].
+
+    This is the ONLY test in the suite that exercises the band-EE radius:
+    band_det_ratio enters totcor1 only through flux_beyond_aper_band, which is
+    ZERO for isolated sources -- so a CROWDED source (flux_beyond_aper > 0) is
+    required. flux_beyond_stamp/flux_beyond_aper are set directly here (rather
+    than via extraction) so the band-EE frame is isolated as the single degree
+    of freedom. Revert-verify: this FAILS against the unconverted r_img_pix
+    band-EE call (which would use EE_band(r_img) ~ 1 instead of
+    EE_band(r_native))."""
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.psf_map import PSFRegionMap
+    import mophongo.utils as utils
+
+    n = 61
+    c = n // 2
+    r_orig = 6.0                       # reference (detection 0.04") grid aperture radius
+    # Coarse band native grid: 0.11"/px vs the 0.04" fit grid (factor 2.75),
+    # exactly the F1500W-vs-F444W upsample setup the reviewer measured.
+    psn = [0.04, 0.11]
+    r_native = r_orig * psn[0] / psn[1]  # ~2.18 native px -- the physically correct radius
+
+    psf_det = _gauss(21, 2.0)          # detection PSF, reference grid
+    psf_band_native = _gauss(21, 2.5)  # band PSF, coarse native grid (self.psfs[1])
+    # EE differs hugely between the two radii -> strong discrimination:
+    assert utils.psf_ee_at_radius(psf_band_native, r_native) < 0.5
+    assert utils.psf_ee_at_radius(psf_band_native, r_orig) > 0.9  # the wrong (fit-grid) value
+
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+    c_det, c_b = 0.9622, 0.9192
+    prm_det = PSFRegionMap(regions=regions, psfs=np.array([psf_det]), containment=c_det)
+    prm_band = PSFRegionMap(regions=regions, psfs=np.array([psf_band_native]), containment=c_b)
+
+    # Crowded faint source: substantial flux_beyond_aper (own PSF tail the fit
+    # support excluded) so band_det_ratio genuinely enters totcor1.
+    TN, FBS, FBA = 5.0, 2.0, 1.5
+    prof = _gauss(n, 2.5)
+    conv = Template(prof.copy(), (c, c), (n, n), label=1); conv.template_norm = TN
+    orig = Template(prof.copy(), (c, c), (n, n), label=1)
+    orig.template_norm = TN
+    orig.flux_beyond_stamp = FBS
+    orig.flux_beyond_aper = FBA
+
+    pl = Pipeline([np.zeros((n, n)), np.zeros((n, n))], np.zeros((n, n), dtype=int))
+    pl.psfs = [prm_det, prm_band]
+    pl._native_pscale = psn        # as captured by run() BEFORE the upsample step
+    pl.config.aperture_diam = 2 * r_orig  # r_img_pix == 6.0 (fine fit px, == r_orig here)
+    pl.config.aperture_units = "pix"
+    cat = Table({"id": [1]})
+    pl._add_aperture_photometry(cat, [conv], np.array([1.0]), np.zeros((n, n)), 1,
+                                r_orig_pix=r_orig, orig_templates=[orig])
+    totcor1 = cat["totcor1_1"][0]
+
+    # Exact reconstruction from the documented Stage-4b formula, with the band
+    # EE evaluated on the NATIVE grid (r_native). Any use of r_img (=6.0) for
+    # the band EE inflates band_det_ratio ~3x and breaks this to ~15%.
+    apB_book = pl._aperture_sum_on_template(conv, r_orig)  # r_img == r_orig here
+    trunc_denom = TN + FBS
+    trunc = TN / trunc_denom
+    ee_band = utils.psf_ee_at_radius(psf_band_native, r_native)
+    ee_det = utils.psf_ee_at_radius(psf_det, r_orig)
+    flux_beyond_aper_band = FBA * (ee_band / ee_det)
+    apB_corr = (apB_book * trunc + flux_beyond_aper_band / trunc_denom) * (c_b / c_det)
+    expected_totcor1 = 1.0 / apB_corr
+    assert totcor1 == pytest.approx(expected_totcor1, rel=1e-6)
+
+    # Guard: the wrong (fit-grid) radius would give a materially different value.
+    ee_band_wrong = utils.psf_ee_at_radius(psf_band_native, r_orig)
+    apB_corr_wrong = (apB_book * trunc + FBA * (ee_band_wrong / ee_det) / trunc_denom) * (c_b / c_det)
+    assert abs(1.0 / apB_corr_wrong - expected_totcor1) / expected_totcor1 > 0.10
 
 
 def test_residual_segmap_sum_same_res():
