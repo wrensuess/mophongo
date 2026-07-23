@@ -572,6 +572,16 @@ comparison.
 - **Unified-template blend details** (halo blend weight functional form, whether the wing
   prior scales with local or global SNR): to be settled at implementation time with tests
   against the §6 criteria.
+- **Estimator-3 catalog tie still on the masked template (Stage 4c, scoped)**: Stage 4b
+  moved the corrections (`totcor1`/`apcor1`) onto the partially-unmasked model, but the
+  Estimator-3 tie (`tcor_int`, `f444w_ktot`, `template_norm`) is still measured on the
+  ownership-masked fit template, so `est3cat` re-inherits the crowding artifact 4b removed
+  (`est3cat/est1` ≈ 1.49× at <0.6″ vs isolated, matching the pre-4b masked-`totcor1`
+  signature). Fix: use the unmasked-model F444W total (`template_norm + flux_beyond_stamp`)
+  in the tie denominator and unmask `f444w_ktot` (scalar top-up). Full diagnosis, rulings,
+  and implementer brief in [`docs/stage4c_scope_and_brief.md`](stage4c_scope_and_brief.md).
+  Underneath it, a separate ~10–16% catalog-vs-IDL F444W total-definition offset remains —
+  a science choice about which total system to anchor to, not a code bug.
 
 ## References
 

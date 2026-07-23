@@ -347,12 +347,16 @@ def test_tcor_int_kron_cap_shares_radius():
 
 def test_tcor_int_apcor_from_psf_shortcut_uses_floor_circle(monkeypatch):
     """apcor_from_psf template + a catalog aperture column: the performance
-    shortcut engages (docs Sec 5.4 "Performance note") -- photutils SourceCatalog
-    is skipped entirely and tcor_int is built directly from the r_floor circle,
-    verified against the same analytic construction used by the internal
-    fallback."""
+    shortcut engages (docs Sec 5.4 "Performance note") -- photutils
+    SourceCatalog is skipped entirely. Stage-4c (docs stage4c_scope_and_brief.md
+    Sec 2/3 D2 option a): this is exactly the floored/PSF-converged population
+    where the ownership-masked Kron leak lived, so the FLOOR-CIRCLE Kron/EE
+    measurement is ALSO skipped now -- f444w_ktot is set directly to the exact
+    unmasked point-source total ``template_norm + flux_beyond_stamp`` (here
+    ``flux_beyond_stamp`` defaults to 0.0 on a bare-constructed Template, so
+    this equals ``tn``), and tcor_int = f444w_ktot / [(template_norm +
+    flux_beyond_stamp) * apF_book] collapses to ``1/apF_book``."""
     import mophongo.pipeline as pipeline_mod
-    import mophongo.utils as utils
     from mophongo.fit import FitConfig
 
     n, tn, fl = 25, 40.0, 2.0
@@ -384,13 +388,9 @@ def test_tcor_int_apcor_from_psf_shortcut_uses_floor_circle(monkeypatch):
         r_orig_pix=5.0, orig_templates=[orig],
     )
 
-    pscale_ref = pl._pixel_scale_arcsec(w)
-    r_floor_pix = 0.5 * 0.4 / pscale_ref
     apF_book = pl._aperture_sum_on_template(orig, 5.0)
-    kron_flux_expected = tn * pl._aperture_sum_on_template(orig, r_floor_pix)
-    ee_kron_expected = utils.psf_ee_at_radius(psf444, r_floor_pix)
-    f444w_ktot_expected = kron_flux_expected / ee_kron_expected
-    tcor_int_expected = f444w_ktot_expected / (tn * apF_book)
+    f444w_ktot_expected = tn   # template_norm + flux_beyond_stamp(=0)
+    tcor_int_expected = 1.0 / apF_book
 
     assert cat["tcor_int_1"][0] == pytest.approx(tcor_int_expected, rel=1e-6)
     assert cat["f444w_ktot_1"][0] == pytest.approx(f444w_ktot_expected, rel=1e-6)
@@ -634,14 +634,22 @@ def test_psf_ee_cache_keys_on_region_not_psf_id():
     reuses freed ids, so an id(psf)-keyed cache collides across regions and
     some sources silently get another region's EE (pre-existing since Phase A).
     Re-targeted from the deleted apB_corr PSF-EE branch to the surviving
-    _psf_ee consumer: the apcor_from_psf Kron-shortcut's ee_kron lookup in
-    _model_kron (docs Sec 5.4). 20 sources in 20 regions with distinct
-    F444W-detection-PSF widths: every tcor_int/f444w_ktot must match the
-    direct curve-of-growth computation for its OWN region."""
+    _psf_ee consumer: the real (non-floored) photutils-Kron path's ee_kron
+    lookup in _model_kron (docs Sec 5.4). Stage-4c (docs
+    stage4c_scope_and_brief.md D1/D2) bypasses this lookup entirely for the
+    apcor_from_psf/floored population -- its f444w_ktot is now the exact
+    unmasked point-source total, independent of any PSF-EE lookup (see
+    test_tcor_int_apcor_from_psf_shortcut_uses_floor_circle) -- so this
+    regression is re-targeted to the still-EE-dependent bright/extended (real
+    SourceCatalog Kron) branch: 20 sources in 20 regions, each with its own
+    real segment and a distinct F444W-detection-PSF width, so every
+    tcor_int/f444w_ktot must match the direct curve-of-growth computation for
+    its OWN region."""
     import geopandas as gpd
     import shapely.geometry as sgeom
     from astropy.wcs import WCS
     from astropy.table import Table as ATable
+    from photutils.segmentation import SourceCatalog, SegmentationImage
     from mophongo.fit import FitConfig
     from mophongo.psf_map import PSFRegionMap
     import mophongo.utils as utils
@@ -662,12 +670,17 @@ def test_psf_ee_cache_keys_on_region_not_psf_id():
     w.wcs.cdelt = [-0.04 / 3600.0, 0.04 / 3600.0]
     w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
 
+    # Real per-source segment (a filled square covering each blob) so
+    # photutils SourceCatalog runs the actual (non-floored) Kron measurement
+    # rather than degrading to _model_kron's own masked-circle fallback.
+    segmap = np.zeros((n, W), dtype=int)
     convs, origs = [], []
     for i, x in enumerate(xs):
+        segmap[:, x - 12:x + 13] = i + 1
         conv = Template(img, (x, 12), (n, n), label=i + 1, wcs=w); conv.template_norm = tn
         orig = Template(img, (x, 12), (n, n), label=i + 1, wcs=w); orig.template_norm = tn
-        orig.snr_seg = 1.0
-        orig.apcor_from_psf = True   # Kron-shortcut path -> deterministic floor circle
+        orig.snr_seg = 20.0
+        orig.apcor_from_psf = False   # bright/template-path -> real Kron measurement
         convs.append(conv); origs.append(orig)
 
     # One region per source (small sky box around it), each with a
@@ -683,12 +696,9 @@ def test_psf_ee_cache_keys_on_region_not_psf_id():
     regions = gpd.GeoDataFrame({"psf_key": list(range(n_src))}, geometry=boxes, crs=None)
     prm_hires = PSFRegionMap(regions=regions, psfs=np.stack(hires_psfs))
 
-    # use_aper (arcsec) chosen so r_floor_pix == 5.0 exactly at pscale=0.04
-    # arcsec/px, sidestepping _model_kron's 0.25-px quantization.
     cat_src = ATable({"id": list(range(1, n_src + 1)), "use_aper": [0.4] * n_src})
     cfg = FitConfig(f444w_aper_col="use_aper")
-    pl = Pipeline([np.zeros((n, W))], np.zeros((n, W), dtype=int),
-                  catalog=cat_src, wcs=[w], config=cfg)
+    pl = Pipeline([np.zeros((n, W))], segmap, catalog=cat_src, wcs=[w], config=cfg)
     pl.psfs = [prm_hires]
     cat = Table({"id": list(range(1, n_src + 1))})
     pl._add_aperture_photometry(cat, convs, np.ones(n_src), np.zeros((n, W)), 1,
@@ -699,9 +709,19 @@ def test_psf_ee_cache_keys_on_region_not_psf_id():
     assert r_floor_pix == pytest.approx(5.0)
     for i, orig in enumerate(origs):
         apF_book = pl._aperture_sum_on_template(orig, 5.0)
-        kron_flux_expected = tn * pl._aperture_sum_on_template(orig, r_floor_pix)
-        ee_expected = utils.psf_ee_at_radius(hires_psfs[i], r_floor_pix)
-        f444w_ktot_expected = kron_flux_expected / ee_expected
+        stamp = orig.data[orig.slices_cutout] * tn
+        seg = segmap[orig.slices_original] == (i + 1)
+        scat = SourceCatalog(stamp, SegmentationImage(seg.astype(int)),
+                              kron_params=(2.5, 1.4, r_floor_pix))
+        kron_flux = float(scat.kron_flux[0])
+        kron_radius = float(scat.kron_radius[0].value)
+        a = float(scat.semimajor_sigma[0].value)
+        b = float(scat.semiminor_sigma[0].value)
+        r_kron = max(2.5 * kron_radius * np.sqrt(a * b), r_floor_pix)
+        r_kron = min(r_kron, 0.5 * min(stamp.shape))
+        r_kron = np.round(r_kron * 4.0) / 4.0   # 0.25-px quantization (EE-cache)
+        ee_expected = utils.psf_ee_at_radius(hires_psfs[i], r_kron)
+        f444w_ktot_expected = kron_flux / ee_expected
         tcor_int_expected = f444w_ktot_expected / (tn * apF_book)
         assert cat["tcor_int_1"][i] == pytest.approx(tcor_int_expected, rel=1e-6), (
             f"source {i}: cached EE came from another region's PSF"
@@ -973,6 +993,248 @@ def test_crowding_regression_totcor1_matches_isolated():
         assert totcor1_crowded == pytest.approx(totcor1_iso, rel=0.03), (
             f"sep={sep}: crowded totcor1 {totcor1_crowded} vs isolated {totcor1_iso}"
         )
+
+
+# --- Stage-4c: unmask the Estimator-3 catalog-tie denominator --------------
+# (docs/stage4c_scope_and_brief.md) -- the SAME real ownership/crowding scene
+# as test_crowding_regression_totcor1_matches_isolated above (faint 40x-
+# fainter target + a 40x brighter neighbour, genuine Templates._build_ownership
+# area contest), extended to wire a catalog color-aperture radius
+# (f444w_aper_col, driving the apcor_from_psf/floored r_floor_pix branch --
+# exactly where the leak lived) and a per-source f444w_totals dict, so the
+# FULL Estimator-3 catalog-tie system (tcor_int, f444w_ktot, s_cat, apcor,
+# ap_flux_est3int/est3cat) is exercised, not just totcor1.
+
+def _crowded_faint_scene(sep, r_floor_pix=5.0, ftot=42.0, r_ap=5.0, ee_reach=20.0,
+                          containment=0.95):
+    """Faint (net-negative-segment) target + an optional 40x brighter
+    neighbour at separation ``sep`` px, built via the real ``Templates``
+    ownership/extraction machinery. Returns ``(cat, orig, pl, psf,
+    containment)`` for the single source (row 0); ``r_floor_pix=None`` skips
+    wiring the catalog color-aperture column (falls back to the point-source
+    ``tcor_int = 1/apF_corr`` path instead of the floored branch)."""
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.templates import Templates
+    from mophongo.psf_map import PSFRegionMap
+    from mophongo.fit import FitConfig
+
+    n = 121
+    sigma = 2.0
+    psf = _gauss(41, sigma)
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+    prm = PSFRegionMap(regions=regions, psfs=np.array([psf]), containment=containment)
+    ty, tx = 60, 40
+
+    image = np.zeros((n, n))
+    segmap = np.zeros((n, n), dtype=int)
+    segmap[ty - 1:ty + 2, tx - 1:tx + 2] = 1  # faint target: net-negative 3x3 segment
+    image[ty - 1:ty + 2, tx - 1:tx + 2] = -1.0
+    image[ty, tx] = 3.0
+    ivar = np.ones((n, n))
+    positions = [(tx, ty)]
+    if sep is not None:
+        nb = _gauss(n, 3.0) * (40 * 3.0 * (2 * np.pi * 3.0 ** 2))  # 40x brighter peak
+        image += nb
+        segmap[nb > nb.max() * np.exp(-0.5)] = 2  # ~1-sigma isophote segment
+        positions.append((tx + sep, ty))
+
+    tmpls = Templates(min_size=n)
+    tmpls.extract_templates(
+        image, segmap, positions, extend_mode="auto",
+        detection_psf=prm, detection_weight=ivar,
+        max_radius_pix=ee_reach, psf_ee_radius_pix=ee_reach,
+        aperture_radius_pix=r_ap,
+        fit_snrlo_psf=10.0, wings_snr_psf=3.0,
+    )
+    orig = tmpls._templates[0]
+    assert orig.snr_seg == 0.0
+
+    cat_src, cfg, wcs_arg = None, FitConfig(), None
+    if r_floor_pix is not None:
+        w = _simple_wcs()
+        pscale_ref = 0.04   # _simple_wcs's pixel scale (arcsec/px)
+        use_aper = 2.0 * r_floor_pix * pscale_ref   # arcsec diameter
+        cat_src = Table({"id": [1], "use_aper": [use_aper]})
+        cfg = FitConfig(f444w_aper_col="use_aper")
+        wcs_arg = [w]
+
+    pl = Pipeline([image], segmap, catalog=cat_src, wcs=wcs_arg, config=cfg)
+    pl.psfs = [prm]
+    pl.config.aperture_diam = 2 * r_ap
+    pl.config.aperture_units = "pix"
+    cat = Table({"id": [1]})
+    f444w_totals = {1: ftot} if ftot is not None else None
+    pl._add_aperture_photometry(cat, [orig], np.array([1.0]), np.zeros((n, n)), 1,
+                                r_orig_pix=r_ap, orig_templates=[orig],
+                                f444w_totals=f444w_totals)
+    return cat, orig, pl, psf, containment
+
+
+def test_est3cat_crowding_flatness():
+    """Acceptance test 1 (Stage-4c, the HEADLINE test): a faint target plus a
+    40x brighter neighbour at several separations must give
+    ap_flux_est3cat/ap_flux_est1 within ~3% of the isolated-separation value
+    across all separations. On unfixed (masked-denominator) code the SAME
+    construction inflates this ratio to ~1.49x at close separation (docs
+    stage4c brief Sec 1's numeric proof) -- driven entirely by the tcor_int
+    denominator (f444w_ktot cancels in tcor_int*s_cat), so this test must
+    fail without the Part-1 denom fix."""
+    cat_iso, *_ = _crowded_faint_scene(None)
+    ratio_iso = cat_iso["ap_flux_est3cat_1"][0] / cat_iso["ap_flux_est1_1"][0]
+    for sep in (15, 20, 25):
+        cat, *_ = _crowded_faint_scene(sep)
+        ratio = cat["ap_flux_est3cat_1"][0] / cat["ap_flux_est1_1"][0]
+        assert ratio == pytest.approx(ratio_iso, rel=0.03), (
+            f"sep={sep}: crowded est3cat/est1 {ratio} vs isolated {ratio_iso}"
+        )
+
+
+def test_est3int_and_f444w_ktot_crowding_flatness():
+    """Acceptance test 2 (Stage-4c D1, whole system): the SAME scene as test
+    1 -- est3int/est1 and the f444w_ktot diagnostic must ALSO lose their
+    crowding dependence (not just est3cat), since f444w_ktot for the floored
+    population is now the same unmasked total the tcor_int denominator uses,
+    rather than a masked circular Kron flux."""
+    cat_iso, *_ = _crowded_faint_scene(None)
+    est1_iso = cat_iso["ap_flux_est1_1"][0]
+    ratio_iso = cat_iso["ap_flux_est3int_1"][0] / est1_iso
+    ktot_iso = cat_iso["f444w_ktot_1"][0]
+    for sep in (15, 20, 25):
+        cat, *_ = _crowded_faint_scene(sep)
+        ratio = cat["ap_flux_est3int_1"][0] / cat["ap_flux_est1_1"][0]
+        assert ratio == pytest.approx(ratio_iso, rel=0.03), (
+            f"sep={sep}: crowded est3int/est1 {ratio} vs isolated {ratio_iso}"
+        )
+        assert cat["f444w_ktot_1"][0] == pytest.approx(ktot_iso, rel=0.03), (
+            f"sep={sep}: crowded f444w_ktot {cat['f444w_ktot_1'][0]} vs isolated {ktot_iso}"
+        )
+
+
+def test_est3_isolated_invariance():
+    """Acceptance test 3 (Stage-4c): for an isolated source with
+    flux_beyond_stamp == 0 (containment=1.0 removes the containment-driven
+    floor of the unmasked total, and the generous ee_reach=20 leaves no real
+    stamp-edge truncation either), the Stage-4c tcor_int/f444w_ktot must
+    reproduce the OLD (ownership-masked) formula almost exactly -- the fix
+    must not move isolated ties. The "old" values are recomputed here via the
+    unchanged :meth:`Pipeline._model_kron` (``use_source_catalog=False``,
+    the same call the floored branch used before Stage-4c) and the masked
+    ``template_norm * apF_book`` denominator."""
+    import mophongo.utils as utils
+
+    cat, orig, pl, psf, containment = _crowded_faint_scene(None, containment=1.0)
+    assert orig.flux_beyond_stamp == pytest.approx(0.0, abs=1e-6)
+
+    r_floor_pix = 5.0
+    r_ap = 5.0
+    apF_book = pl._aperture_sum_on_template(orig, r_ap)
+    kron_flux_old, r_kron_old = pl._model_kron(orig, 1, r_floor_pix, use_source_catalog=False)
+    ee_kron_old = utils.psf_ee_at_radius(psf, r_kron_old) * containment
+    f444w_ktot_old = kron_flux_old / ee_kron_old
+    denom_old = orig.template_norm * apF_book
+    tcor_int_old = f444w_ktot_old / denom_old
+
+    assert cat["f444w_ktot_1"][0] == pytest.approx(f444w_ktot_old, rel=2e-3)
+    assert cat["tcor_int_1"][0] == pytest.approx(tcor_int_old, rel=2e-3)
+
+
+def test_est1_est2_unchanged_by_stage4c():
+    """Acceptance test 4 (D4 ruling): est1/est2 do not use the Estimator-3
+    tie at all, so Stage-4c must leave them exactly at their closed forms
+    ``(ap_model + res_sum) * totcor1`` / ``ap_model * totcor1 + res_sum``
+    (untouched by the tcor_int/f444w_ktot edit) -- checked on both the
+    isolated and a crowded instance of the same scene used above."""
+    for sep in (None, 15, 20, 25):
+        cat, *_ = _crowded_faint_scene(sep)
+        ap_model = cat["ap_model_1"][0]
+        res_sum = cat["res_sum_1"][0]
+        totcor1 = cat["totcor1_1"][0]
+        assert cat["ap_flux_est1_1"][0] == pytest.approx(
+            (ap_model + res_sum) * totcor1, rel=1e-6
+        ), f"sep={sep}"
+        assert cat["ap_flux_est2_1"][0] == pytest.approx(
+            ap_model * totcor1 + res_sum, rel=1e-6
+        ), f"sep={sep}"
+
+
+def test_est3_faint_limit_identity():
+    """Acceptance test 5 (Stage-4c): in the pure-PSF (net-negative-segment)
+    limit, the unmasked total equals the containment-corrected true total
+    ``A_src/c_det == template_norm + flux_beyond_stamp`` (established via
+    totcor1 by the already-passing
+    test_totcor1_faint_limit_matches_true_total_psf_ee); f444w_ktot must
+    reproduce this identity EXACTLY, in both the no-r_floor fallback branch
+    and the r_floor/floored-population branch, and tcor_int must reproduce
+    its own closed form in each."""
+    import geopandas as gpd
+    import shapely.geometry as sgeom
+    from mophongo.templates import Templates
+    from mophongo.psf_map import PSFRegionMap
+    from mophongo.fit import FitConfig
+
+    n = 41
+    c = n // 2
+    psf = _gauss(21, 2.5)
+    regions = gpd.GeoDataFrame(
+        {"psf_key": [0]}, geometry=[sgeom.box(-1e4, -1e4, 1e4, 1e4)], crs=None
+    )
+    prm = PSFRegionMap(regions=regions, psfs=np.array([psf]), containment=0.9)
+
+    image = np.zeros((n, n))
+    segmap = np.zeros((n, n), dtype=int)
+    segmap[c - 1:c + 2, c - 1:c + 2] = 1
+    image[c - 1:c + 2, c - 1:c + 2] = -1.0
+    image[c, c] = 3.0
+    ivar = np.ones((n, n))
+
+    r_reach = 5.0   # << stamp size: leaves real stamp-edge truncation too
+    tmpls = Templates(min_size=n)
+    tmpls.extract_templates(
+        image, segmap, [(c, c)], extend_mode="auto",
+        detection_psf=prm, detection_weight=ivar,
+        max_radius_pix=r_reach, psf_ee_radius_pix=r_reach,
+        aperture_radius_pix=3.0,
+        fit_snrlo_psf=10.0, wings_snr_psf=3.0,
+    )
+    orig = tmpls._templates[0]
+    assert orig.snr_seg == 0.0
+    assert orig.flux_beyond_stamp > 0
+    unmasked_total = orig.template_norm + orig.flux_beyond_stamp
+
+    # --- Branch A: no catalog aperture column -> point-source fallback. ---
+    pl_a = Pipeline([image], segmap)
+    pl_a.psfs = [np.ones((5, 5))]   # unused: no f444w_aper_col configured
+    pl_a.config.aperture_diam = 6.0
+    pl_a.config.aperture_units = "pix"
+    cat_a = Table({"id": [1]})
+    pl_a._add_aperture_photometry(cat_a, [orig], np.array([1.0]), np.zeros((n, n)), 1,
+                                  r_orig_pix=5.0, orig_templates=[orig])
+    apF_corr_a = cat_a["apcor1_1"][0] / cat_a["totcor1_1"][0]
+
+    assert cat_a["f444w_ktot_1"][0] == pytest.approx(unmasked_total, rel=1e-6)
+    assert cat_a["tcor_int_1"][0] == pytest.approx(1.0 / apF_corr_a, rel=1e-6)
+
+    # --- Branch B: catalog aperture column present -> the floored branch
+    # (apcor_from_psf is True here: snr_seg == 0 < fit_snrlo_psf). ---
+    w = _simple_wcs()
+    pscale_ref = 0.04
+    r_floor_pix = 5.0
+    cat_src = Table({"id": [1], "use_aper": [2.0 * r_floor_pix * pscale_ref]})
+    cfg = FitConfig(f444w_aper_col="use_aper")
+    pl_b = Pipeline([image], segmap, catalog=cat_src, wcs=[w], config=cfg)
+    pl_b.psfs = [prm]
+    pl_b.config.aperture_diam = 6.0
+    pl_b.config.aperture_units = "pix"
+    cat_b = Table({"id": [1]})
+    pl_b._add_aperture_photometry(cat_b, [orig], np.array([1.0]), np.zeros((n, n)), 1,
+                                  r_orig_pix=5.0, orig_templates=[orig])
+    apF_book_b = pl_b._aperture_sum_on_template(orig, 5.0)
+
+    assert cat_b["f444w_ktot_1"][0] == pytest.approx(unmasked_total, rel=1e-6)
+    assert cat_b["tcor_int_1"][0] == pytest.approx(1.0 / apF_book_b, rel=1e-6)
 
 
 def test_fit_invariant_to_containment_perturbation():

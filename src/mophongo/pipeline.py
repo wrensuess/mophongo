@@ -747,20 +747,40 @@ class Pipeline:
         ap_flux_est3cat = ap_model * apcor1 * tcor_int * s_cat + res_sum  (catalog-tied release)
 
         Stage-3b two-step catalog tie (docs/aperture_corrections.md Sec 5.4), all
-        evaluated on MODELS (never on measured aperture flux):
+        evaluated on MODELS (never on measured aperture flux). Stage-4c (docs
+        stage4c_scope_and_brief.md): the tie denominator and F444W_total_moph
+        are UNMASKED, consistent with the Stage-4b apcor1/totcor1 fix --
+        ``template_norm`` alone (Sigma(H) over the OWNED support only) is
+        replaced by ``template_norm + flux_beyond_stamp`` (the containment-
+        corrected TRUE total, crowding-independent by construction), so a
+        close neighbour's ownership boundary no longer leaks into the
+        catalog-tied estimator the way it still could after 4b:
 
-        tcor_int = F444W_total_moph / (template_norm * apF_book)
-          F444W_total_moph = kron_flux_model / EE_true_444(r_kron_circ), where
-          ``kron_flux_model``/``r_kron_circ`` come from :meth:`_model_kron` -- a
-          photutils Kron measurement on the fitted F444W template's own model
-          stamp, with the circularized Kron radius floored at the catalog
-          color-aperture radius ``r_floor_pix`` (0.5 * catalog[f444w_aper_col] /
-          pscale_ref). Without a usable ``f444w_aper_col`` this degrades to the
-          true-normalized point-source form, ``tcor_int = 1/apF_corr``, for
-          every source (noted once).
+        tcor_int = F444W_total_moph / [(template_norm + flux_beyond_stamp) * apF_book]
+          F444W_total_moph (= f444w_ktot) is, for the floored/PSF-converged
+          population (``apcor_from_psf`` True -- exactly where the ownership-
+          masked leak lived, docs stage4c brief Sec "KEY GROUNDING FINDING"),
+          set DIRECTLY to ``template_norm + flux_beyond_stamp``: the exact
+          point-source total in the faint pure-PSF limit
+          (``A_src/c_det``), no photutils/PSF-EE lookup needed. For the
+          non-floored (bright/extended, real photutils Kron) population it
+          stays ``kron_flux_model / EE_true_444(r_kron_circ)`` as before
+          (``kron_flux_model``/``r_kron_circ`` from :meth:`_model_kron`,
+          Kron radius floored at the catalog color-aperture radius
+          ``r_floor_pix`` = 0.5 * catalog[f444w_aper_col] / pscale_ref) --
+          these sources have large owned support so the clipped fraction is
+          small, and the masked photutils Kron preserves real extended
+          structure a PSF-total would throw away. Without a usable
+          ``f444w_aper_col`` this degrades to the true-normalized
+          point-source form, ``tcor_int = 1/apF_corr`` (already unmasked per
+          4b) with ``f444w_ktot = template_norm + flux_beyond_stamp`` for
+          consistency, for every source (noted once).
         s_cat = ftot / F444W_total_moph   (bad_value without a POSITIVE catalog total)
         apcor  = apcor1 * tcor_int * s_cat   (the full released correction;
-                 bad_value when s_cat is bad -- REPURPOSED from Stage 3a)
+                 bad_value when s_cat is bad -- REPURPOSED from Stage 3a; note
+                 f444w_ktot always CANCELS in tcor_int*s_cat = ftot/denom, so
+                 est3cat is fixed by the denom change alone -- docs stage4c
+                 brief Sec 1)
 
         Per parent id, ap_model is accumulated over any multi-component
         templates; the corrections and residual are computed once.
@@ -1070,35 +1090,77 @@ class Pipeline:
                 # No usable catalog color-aperture radius for this source
                 # (column missing/not configured, or id absent from the
                 # lookup): the true-normalized point-source fallback.
+                # tcor_int itself is already unmasked (apF_corr carries the
+                # Stage-4b trunc/flux_beyond_aper correction); f444w_ktot is
+                # unmasked here too (Stage-4c D1) for consistency with the
+                # r_floor branch below -- was `template_norm_i * apF_book *
+                # tcor_int` (a MASKED numerator, apF_book, times the unmasked
+                # tcor_int), which re-introduced the ownership-masked leak
+                # into this diagnostic column. This fallback IS the point-
+                # source case, so its total is exactly trunc_denom, the same
+                # identity the floored branch below uses.
                 tcor_int_ok = apF_corr > 0
                 if tcor_int_ok:
                     tcor_int = 1.0 / apF_corr
-                    f444w_ktot = template_norm_i * apF_book * tcor_int
+                    f444w_ktot = trunc_denom
                 else:
                     tcor_int = float(cfg.bad_value)
                     f444w_ktot = float(cfg.bad_value)
             else:
+                # Stage-4c (D1 whole system, D2 option a): the tie
+                # denominator uses the UNMASKED total (trunc_denom =
+                # template_norm_i + flux_beyond, already computed above for
+                # the apF_corr/apB_corr block) in place of the ownership-
+                # MASKED template_norm_i alone -- this is the fix for the
+                # released est3cat leak (docs stage4c brief Sec 1: f444w_ktot
+                # cancels in tcor_int*s_cat, so this denom change alone makes
+                # est3cat crowding-independent). apF_book itself is left
+                # untouched (bookkeeping fraction, per the brief).
+                denom = trunc_denom * apF_book
+
                 # apcor_from_psf performance shortcut: a PSF-converged
                 # faint/compact template's Kron radius floors anyway, so skip
                 # photutils SourceCatalog and use the floor circle directly
                 # (also the scientifically right faint limit per the doc).
-                kron_flux_model, r_kron_circ = self._model_kron(
-                    orig_t, int(tmpl.id), r_floor_pix,
-                    use_source_catalog=not getattr(orig_t, "apcor_from_psf", False),
-                )
-                ee_kron = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_kron_circ)
-                if ee_kron is None or ee_kron <= 0:
-                    ee_kron = self._aperture_sum_on_template(orig_t, r_kron_circ)
-                denom = template_norm_i * apF_book
-                tcor_int_ok = bool(
-                    ee_kron and ee_kron > 0 and kron_flux_model > 0 and denom > 0
-                )
-                if tcor_int_ok:
-                    f444w_ktot = kron_flux_model / ee_kron
-                    tcor_int = f444w_ktot / denom
+                # Stage-4c: this is exactly the population where the
+                # ownership-masked Kron leak lived (docs stage4c brief Sec
+                # "KEY GROUNDING FINDING"), so f444w_ktot is set DIRECTLY to
+                # the unmasked point-source total instead of measuring a
+                # masked circular Kron flux and dividing by EE(r_floor) (which
+                # reproduced the SAME masked total the fallback branch used
+                # to) -- no _model_kron/PSF-EE lookup needed at all here
+                # (cheaper, and exact in the faint pure-PSF limit where
+                # trunc_denom == A_src/c_det, docs Sec 2).
+                if getattr(orig_t, "apcor_from_psf", False):
+                    f444w_ktot = trunc_denom
+                    tcor_int_ok = bool(denom > 0 and f444w_ktot > 0)
+                    if tcor_int_ok:
+                        tcor_int = f444w_ktot / denom
+                    else:
+                        tcor_int = float(cfg.bad_value)
+                        f444w_ktot = float(cfg.bad_value)
                 else:
-                    tcor_int = float(cfg.bad_value)
-                    f444w_ktot = float(cfg.bad_value)
+                    # Non-floored (bright/extended) population: keep the
+                    # masked photutils Kron measurement (docs stage4c brief
+                    # Sec 2 "recommended route" -- these sources have large
+                    # owned support so the clipped fraction is small, and the
+                    # masked Kron preserves real extended structure that the
+                    # unmasked PSF-total substitution above would throw away).
+                    kron_flux_model, r_kron_circ = self._model_kron(
+                        orig_t, int(tmpl.id), r_floor_pix, use_source_catalog=True,
+                    )
+                    ee_kron = _psf_ee(psf_hires, ra_dec[0], ra_dec[1], r_kron_circ)
+                    if ee_kron is None or ee_kron <= 0:
+                        ee_kron = self._aperture_sum_on_template(orig_t, r_kron_circ)
+                    tcor_int_ok = bool(
+                        ee_kron and ee_kron > 0 and kron_flux_model > 0 and denom > 0
+                    )
+                    if tcor_int_ok:
+                        f444w_ktot = kron_flux_model / ee_kron
+                        tcor_int = f444w_ktot / denom
+                    else:
+                        tcor_int = float(cfg.bad_value)
+                        f444w_ktot = float(cfg.bad_value)
 
             # s_cat requires a POSITIVE catalog total: a negative f_f444w (an
             # F444W non-detection) cannot define a total-flux system, so the
