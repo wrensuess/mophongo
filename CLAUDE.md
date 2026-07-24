@@ -26,7 +26,7 @@ The photometry pipeline follows this sequence:
 2. **PSF Handling** (`psf.py`, `psf_map.py`) - Manage point spread functions and spatially-varying PSF maps
 3. **Convolution/Matching** - Match PSFs between images using kernels
 4. **Sparse Fitting** (`fit.py`) - Solve for source fluxes using sparse matrix methods
-5. **Astrometric Correction** (`local_astrometry.py`) - Optional astrometric refinement
+5. **Astrometric Correction** (`astrometry.py`) - Optional astrometric refinement
 
 ### Key Classes and Components
 

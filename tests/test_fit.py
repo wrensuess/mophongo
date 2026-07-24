@@ -42,34 +42,6 @@ def test_flux_recovery(tmp_path):
     assert fname.exists()
 
 
-@pytest.mark.xfail(
-    reason="SparseFitter has no solve_lo() method -- the linear-operator solve "
-    "path ('lo' in FitConfig.solve_method's docstring) was never implemented "
-    "on the class, this is not a rename. See docs/test_suite_cleanup_plan.md B2/A6.",
-    strict=False,
-)
-def test_lsqr_lo_matches_cg():
-    images, segmap, catalog, psfs, _, rms = make_simple_data()
-
-    psf_hi = PSF.from_array(psfs[0])
-    psf_lo = PSF.from_array(psfs[1])
-    kernel = psf_hi.matching_kernel(psf_lo)
-
-    tmpls1 = Templates.from_image(
-        images[0], segmap, list(zip(catalog["x"], catalog["y"])), kernel
-    )
-    fitter_lo = SparseFitter(tmpls1.templates, images[1], 1.0 / rms[1] ** 2, FitConfig())
-    flux_lo, err_lo, _ = fitter_lo.solve_lo()
-
-    tmpls2 = Templates.from_image(
-        images[0], segmap, list(zip(catalog["x"], catalog["y"])), kernel
-    )
-    fitter_cg = SparseFitter(tmpls2.templates, images[1], 1.0 / rms[1] ** 2, FitConfig())
-    flux_cg, err_cg, _ = fitter_cg.solve()
-
-    np.testing.assert_allclose(flux_lo, flux_cg, rtol=2e-3, atol=2e-3)
-    assert err_lo.shape == err_cg.shape
-
 
 def test_ata_symmetry():
     images, segmap, catalog, psfs, _, rms = make_simple_data()
@@ -227,29 +199,6 @@ def test_solve_scene_matches_global():
 # adapt it to, so the dead test has been removed (see plan B2).
 
 
-@pytest.mark.xfail(
-    reason="SparseFitter.bright_mask is never set: __init__ computes snr but "
-    "the assignment is commented out (fit.py:751, `self.orig_bright = ...`), "
-    "and no other code path defines a `bright_mask` attribute (the only other "
-    "reference, fit.py:1582, is dead code inside an unreachable nested def). "
-    "This is a real gap, not a rename. See docs/test_suite_cleanup_plan.md B2/A6.",
-    strict=False,
-)
-def test_bright_source_detection():
-    images, segmap, catalog, psfs, _, rms = make_simple_data()
-    tmpls = Templates.from_image(
-        images[0], segmap, list(zip(catalog["x"], catalog["y"])), kernel=None
-    )
-    cfg = FitConfig(snr_thresh_astrom=5.0)
-    fitter = SparseFitter(
-        tmpls.templates, images[1], 1.0 / rms[1] ** 2, cfg
-    )
-    flux = Templates.quick_flux(tmpls.templates, images[1])
-    err = Templates.predicted_errors(tmpls.templates, 1.0 / rms[1] ** 2)
-    snr = flux / err
-    expected = snr > cfg.snr_thresh_astrom
-    assert np.array_equal(fitter.bright_mask, expected)
-
 
 def test_solve_scene_shifts_matches_global():
     img = np.zeros((6, 6))
@@ -364,20 +313,15 @@ def test_solve_method_scene_is_supported():
     assert np.all(np.isfinite(x))
 
 
-@pytest.mark.xfail(
-    reason="SparseFitter.solve() dispatches any solve_method other than 'scene' "
-    "to self.solve_all(), which is not defined anywhere on the class -> "
-    "AttributeError. See docs/test_suite_cleanup_plan.md A6 ('solve_method guard').",
-    strict=False,
-)
 def test_solve_method_all_not_supported():
+    # Only 'scene' is implemented; any other solve_method must fail loudly.
     img = np.zeros((4, 4))
     weights = np.ones_like(img)
     t = Template(img, (1, 1), (2, 2))
     t.data[:] = 1.0
     fitter = SparseFitter([t], img, weights, FitConfig(solve_method="all"))
-    x, err, info = fitter.solve()
-    assert x.shape == (1,)
+    with pytest.raises(ValueError, match="only 'scene' is implemented"):
+        fitter.solve()
 
 
 @pytest.mark.xfail(

@@ -19,14 +19,6 @@ from .psf_map import PSFRegionMap
 
 
 @dataclass
-class Frame:
-    """Simple image frame with WCS."""
-
-    data: np.ndarray
-    wcs: WCS
-
-
-@dataclass
 class MosaicDataset:
     """Container holding the simulated dataset."""
 

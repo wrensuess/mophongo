@@ -77,14 +77,6 @@ from skimage.morphology import disk
 # --- helpers ---------------------------------------------------------------
 
 
-def _mean_downsample(arr: np.ndarray, fact: int) -> np.ndarray:
-    a = np.asarray(arr, dtype=np.float32)
-    H, W = a.shape
-    H2, W2 = (H // fact) * fact, (W // fact) * fact
-    if H2 != H or W2 != W:
-        a = a[:H2, :W2]
-    a = a.reshape(H2 // fact, fact, W2 // fact, fact)
-    return a.mean(axis=(1, 3), dtype=np.float32)
 
 
 def bg_gaussian_normalized(img, bgmask, sigma=20.0, truncate=3.0):
@@ -230,123 +222,6 @@ def get_bg_and_ivar(
     return bg_img, ivar_new
 
 
-def calibrate_ivar_with_bg_median(
-    sci: np.ndarray,
-    wht: np.ndarray,
-    *,
-    bg_scale: int = 64,  # area in native px; bin factor = sqrt(bg_scale)
-    detect_sigma: float = 2.0,  # n-threshold in coarse S/N units
-    ndilate: int = 2,  # dilation radius on coarse grid
-    bg_smooth_sigma_bin: float = 2.0,  # Gaussian sigma (coarse px) for bg smoothing
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Background/noise calibration via block-sum + median detrending and two-pass detection.
-
-    Steps
-    -----
-    - Bin by N = round(sqrt(bg_scale)) using SUM for science and MEAN for weights.
-    - Build det image: det_bin = sci_bin * sqrt(w_bin).
-    - Median-filter det_bin (size=N) and subtract for initial trend removal.
-    - Estimate σ via MAD on detrended det_bin.
-    - Two-pass detection on det_bin:
-        1) convolve with disk(2), detect at detect_sigma*σ*sigma_conv_correct, npixels=N*N
-        2) detect on raw detrended det_bin at detect_sigma*σ
-        Combine masks and dilate by ndilate.
-    - Measure background on sci_bin with bg_gaussian_normalized + bgmask.
-    - Recompute σ on bg pixels after bg subtraction, then correct for bin: σ_full = σ_bin / N.
-    - Rescale full-res weights by 1/σ_full^2 and upsample per-pixel background.
-
-    Returns
-    -------
-    ivar_new : float32 (H, W)
-    bg_full  : float32 (H, W)
-    """
-    s = np.asarray(sci, dtype=np.float32)
-    w = np.asarray(wht, dtype=np.float32)
-
-    valid_w = np.isfinite(w) & (w > 0)
-    w = np.where(valid_w, w, 0.0).astype(np.float32)
-
-    N = max(1, int(round(np.sqrt(float(bg_scale)))))
-
-    # Block-sum science; weights downsampled by mean
-    s_bin = block_reduce(s, N, func=np.mean).astype(np.float32)
-    w_bin = _mean_downsample(w, N)
-    pos = w_bin > 0
-
-    # Noise-equalised coarse DET
-    det_bin = np.zeros_like(s_bin, dtype=np.float32)
-    det_bin[pos] = s_bin[pos] * np.sqrt(w_bin[pos])
-
-    # Median filter detrending on DET
-    k_med = max(5, N)
-    bg_bin = bg_gaussian_normalized(s_bin, bgmask, sigma=float(bg_smooth_sigma_bin), truncate=3.0)
-
-    det_trend = median_filter(det_bin, size=k_med, mode="nearest")
-    det0 = det_bin - det_trend
-
-    # Robust σ on detrended DET
-    ok0 = np.isfinite(det0) & pos
-    if not np.any(ok0):
-        ok0 = pos
-    sigma0 = mad_std(det0[ok0].astype(np.float32))
-    if not np.isfinite(sigma0) or sigma0 <= 0:
-        sigma0 = np.std(det0[ok0].astype(np.float32))
-
-    # Two-pass detection
-    k = disk(2).astype(np.float32)
-    detc = fftconvolve(det0, k, mode="same")
-    sigma_conv = np.sqrt((k**2).sum()) / k.sum()
-
-    seg1 = detect_sources(
-        detc,
-        threshold=float(detect_sigma) * float(sigma0) * float(sigma_conv),
-        npixels=N * N,
-        connectivity=8,
-    )
-    seg2 = detect_sources(
-        det0,
-        threshold=float(detect_sigma) * float(sigma0),
-        npixels=3,  # conservative second pass
-        connectivity=8,
-    )
-
-    m1 = (seg1.data > 0) if (seg1 is not None) else 0
-    m2 = (seg2.data > 0) if (seg2 is not None) else 0
-    seg_mask = (m1 | m2).astype(bool)
-
-    # Background mask = not detected and valid weight
-    bgmask = (~seg_mask) & pos
-    if ndilate > 0:
-        bgmask = binary_dilation(bgmask, structure=disk(int(ndilate)))
-
-    # Background on SUM-binned science, mask-aware smoothing
-    bg_bin = bg_gaussian_normalized(s_bin, bgmask, sigma=float(bg_smooth_sigma_bin), truncate=3.0)
-
-    # Recompute σ on bg pixels after bg subtraction (in DET space)
-    s_bin_bsub = s_bin - bg_bin
-    det_bsub = np.zeros_like(det_bin, dtype=np.float32)
-    det_bsub[pos] = s_bin_bsub[pos] * np.sqrt(w_bin[pos])
-
-    ok_bg = bgmask & np.isfinite(det_bsub)
-    if not np.any(ok_bg):
-        ok_bg = pos
-    sigma_bin = mad_std(det_bsub[ok_bg].astype(np.float32))
-    if not np.isfinite(sigma_bin) or sigma_bin <= 0:
-        sigma_bin = np.std(det_bsub[ok_bg].astype(np.float32))
-
-    # Bin-correct to native pixel units
-    sigma_full = float(sigma_bin) * float(N)
-
-    # Rescale full-res inverse variance
-    scale = np.float32(1.0) / (np.float32(sigma_full) ** 2 + np.float32(1e-30))
-    ivar_new = np.where(valid_w, (w * scale).astype(np.float32), 0.0).astype(np.float32)
-
-    # Convert SUM background back to per-pixel MEAN before upsampling
-    bg_full = expand_to_full(bg_bin.astype(np.float32), N, s.shape)
-    bg_full[~valid_w] = 0.0
-
-    return ivar_new, bg_full
 
 
 def safe_dilate_segmentation(segmap: SegmentationImage, selem=disk(1.5)):
@@ -389,35 +264,7 @@ def _mean_downsample(arr, fact):
     return view.mean(axis=(1, 3), dtype=arr.dtype)
 
 
-def _sigma_clip(arr, sigma=3.0):
-    """Vectorised σ-clip that returns a boolean mask."""
-    med = np.median(arr)
-    dev = sigma * mad_std(arr, ignore_nan=True)
-    return np.abs(arr - med) > dev
 
-
-def noise_equalised_image(data: np.ndarray, weight: np.ndarray | None = None) -> np.ndarray:
-    """Return image divided by the per-pixel noise."""
-    if weight is None:
-        return data
-    return data * np.sqrt(weight)
-
-
-def detect_peaks(
-    img_eq: np.ndarray,
-    sigma: float = 3.0,
-    npix_min: int = 5,
-    kernel_w: int = 3,
-) -> tuple[SegmentationImage, SourceCatalog]:
-    """Detect peaks in a noise-equalised image."""
-
-    kernel = Gaussian2DKernel(kernel_w / 2.355, x_size=npix_min, y_size=npix_min)
-
-    sm = fftconvolve(img_eq, kernel.array, mode="same")
-    std = mad_std(sm)
-    seg = detect_sources(sm, sigma * std, npixels=npix_min)
-    props = SourceCatalog(img_eq, seg)
-    return seg, props
 
 
 def fit_psf_stamp(
@@ -439,12 +286,6 @@ def fit_psf_stamp(
     return coeff[0], chi2 / dof
 
 
-def vet_by_chi2(star_list: Table, chi2_max: float = 3.0) -> Table:
-    """Filter table rows by reduced chi^2."""
-
-    mask = star_list["chi2_red"] < chi2_max
-    return star_list[mask]
-
 
 import numpy as np
 from astropy.nddata import block_reduce
@@ -454,11 +295,6 @@ from photutils.segmentation import detect_sources, SourceCatalog
 from scipy.ndimage import minimum_filter
 
 
-def _expand_remap(pos_xy, k):
-    # center-of-pixel convention (pixel centers at integers)
-    shift = (k - 1) / 2.0
-    x, y = pos_xy
-    return (x + shift) * k, (y + shift) * k
 
 
 import numpy as np
@@ -581,14 +417,6 @@ DEFAULT_COLUMNS = [
     "kron_fluxerr",
 ]
 
-
-@dataclass
-class CatConfig:
-    """Configuration options for :class:`SparseFitter`."""
-
-    # aperture in
-    aperture: float | str = "use_aper"
-    aperture_units: str = "arcsec"
 
 
 @dataclass

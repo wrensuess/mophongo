@@ -746,6 +746,16 @@ class Pipeline:
         ap_flux_est3int = ap_model * apcor1 * tcor_int + res_sum          (internal-Kron total)
         ap_flux_est3cat = ap_model * apcor1 * tcor_int * s_cat + res_sum  (catalog-tied release)
 
+        Per-estimator errors -- the fractional profile-fit error (err/flux from
+        the sparse solve) propagated onto each estimator's corrected MODEL flux
+        (correction * ap_model = est minus its residual term). Multiplicative
+        corrections are treated as noiseless and the res_sum aperture pixel-noise
+        term is NOT included, so these track the fit SNR, err/flux:
+        err_ap_flux_est1    = |totcor1 * ap_model|                 * (err/flux)
+        err_ap_flux_est2    = |totcor1 * ap_model|                 * (err/flux)  (= est1's)
+        err_ap_flux_est3int = |apcor1 * tcor_int * ap_model|        * (err/flux)
+        err_ap_flux_est3cat = |apcor1 * tcor_int * s_cat * ap_model| * (err/flux)
+
         Stage-3b two-step catalog tie (docs/aperture_corrections.md Sec 5.4), all
         evaluated on MODELS (never on measured aperture flux). Stage-4c (docs
         stage4c_scope_and_brief.md): the tie denominator and F444W_total_moph
@@ -789,7 +799,9 @@ class Pipeline:
         tcor_int_{idx}, s_cat_{idx}, f444w_ktot_{idx} (= F444W_total_moph),
         apcor_{idx} (repurposed product), res_sum_{idx}, res_seg_{idx},
         ap_flux_{idx}, ap_flux_est1_{idx}, ap_flux_est2_{idx},
-        ap_flux_est3int_{idx}, ap_flux_est3cat_{idx}.
+        ap_flux_est3int_{idx}, ap_flux_est3cat_{idx}, and the matching
+        err_ap_flux_est1_{idx}, err_ap_flux_est2_{idx},
+        err_ap_flux_est3int_{idx}, err_ap_flux_est3cat_{idx}.
         """
         cfg = self.config
         id_to_row = {int(i): k for k, i in enumerate(cat["id"])}
@@ -858,6 +870,10 @@ class Pipeline:
             f"ap_flux_est2_{idx}",
             f"ap_flux_est3int_{idx}",
             f"ap_flux_est3cat_{idx}",
+            f"err_ap_flux_est1_{idx}",
+            f"err_ap_flux_est2_{idx}",
+            f"err_ap_flux_est3int_{idx}",
+            f"err_ap_flux_est3cat_{idx}",
         ):
             if name not in cat.colnames:
                 cat[name] = cfg.bad_value
@@ -1213,6 +1229,21 @@ class Pipeline:
             tcor_int = d["tcor_int"]
             s_cat = d["s_cat"]
             res_sum = d["res_sum"]
+            # Fractional profile-fit error (err/flux) from the sparse solve,
+            # used to propagate a photometric error onto each estimator below.
+            # flux_{idx}/err_{idx} are populated by _update_catalog_with_fluxes
+            # before this method in a full run; guard for their absence so the
+            # method is still callable standalone (unit tests) -> errors stay bad.
+            if f"flux_{idx}" in cat.colnames and f"err_{idx}" in cat.colnames:
+                flux_fit = cat[f"flux_{idx}"][row]
+                err_fit = cat[f"err_{idx}"][row]
+                frac_err = (
+                    float(err_fit / flux_fit)
+                    if (np.isfinite(flux_fit) and flux_fit > 0 and np.isfinite(err_fit))
+                    else float("nan")
+                )
+            else:
+                frac_err = float("nan")
             cat[f"ap_model_{idx}"][row] = ap_model
             cat[f"apcor1_{idx}"][row] = apcor1
             cat[f"totcor1_{idx}"][row] = totcor1
@@ -1231,10 +1262,23 @@ class Pipeline:
             # by the internal template curve of growth (totcor1 = 1/apB), +
             # residual.
             cat[f"ap_flux_est2_{idx}"][row] = ap_model * totcor1 + res_sum
+            # Per-estimator errors: the fractional profile-fit error carried onto
+            # each estimator's corrected MODEL flux (correction * ap_model, i.e.
+            # est minus its residual term). Multiplicative corrections are treated
+            # as noiseless; the res_sum aperture pixel-noise term is NOT included.
+            # est1 and est2 share the model part (totcor1 * ap_model) -> same error.
+            if np.isfinite(frac_err):
+                err_est12 = abs(totcor1 * ap_model) * frac_err
+                cat[f"err_ap_flux_est1_{idx}"][row] = err_est12
+                cat[f"err_ap_flux_est2_{idx}"][row] = err_est12
             # Estimator 3int (internal-Kron total): model aperture flux scaled
             # by apcor1 * tcor_int, + unscaled residual.
             if d["tcor_int_ok"]:
                 cat[f"ap_flux_est3int_{idx}"][row] = ap_model * apcor1 * tcor_int + res_sum
+                if np.isfinite(frac_err):
+                    cat[f"err_ap_flux_est3int_{idx}"][row] = (
+                        abs(apcor1 * tcor_int * ap_model) * frac_err
+                    )
             else:
                 cat[f"ap_flux_est3int_{idx}"][row] = cfg.bad_value
             # apcor (repurposed): the full released correction apcor1 * tcor_int
@@ -1244,6 +1288,10 @@ class Pipeline:
                 apcor_released = apcor1 * tcor_int * s_cat
                 cat[f"apcor_{idx}"][row] = apcor_released
                 cat[f"ap_flux_est3cat_{idx}"][row] = ap_model * apcor_released + res_sum
+                if np.isfinite(frac_err):
+                    cat[f"err_ap_flux_est3cat_{idx}"][row] = (
+                        abs(apcor_released * ap_model) * frac_err
+                    )
             else:
                 cat[f"apcor_{idx}"][row] = cfg.bad_value
                 cat[f"ap_flux_est3cat_{idx}"][row] = cfg.bad_value
@@ -1261,7 +1309,6 @@ class Pipeline:
             The fitter instance used for the final fit.
         """
         from .fit import SparseFitter
-        from .astro_fit import GlobalAstroFitter
         from .astrometry import AstroCorrect
         import warnings
 
@@ -1895,41 +1942,3 @@ def run(
         config=config,
     )
     return pipeline.run()
-
-    # # EXTREMELY SLOW
-    # # block into tiles for faster access
-    # store = zarr.storage.MemoryStore()
-    # group = zarr.group(store=store)  # container
-    # fast = Blosc(cname="lz4", clevel=1, shuffle=Blosc.BITSHUFFLE)  # fastest
-    # tight = Blosc(cname="zstd", clevel=1, shuffle=Blosc.BITSHUFFLE)  # better ratio, still fast
-    # # You can control threads with Blosc(nthreads=<N>) if desired.
-    # for i in range(len(images)):
-    #     if images[i] is not None:
-    #         img = group.create_array(
-    #             f"images/{i}",
-    #             shape=(images[i].shape),
-    #             chunks=(512, 512),
-    #             dtype="float32",
-    #             compressors=None,  # <- critical
-    #             filters=None,  # <- critical
-    #             overwrite=True,
-    #             fill_value=0.0,
-    #         )
-    #         img[:] = images[i]
-    #         images[i] = img
-
-    #     if weights[i] is not None:
-    #         wht = group.create_array(
-    #             f"weights/{i}",
-    #             shape=(weights[i].shape),
-    #             chunks=(512, 512),
-    #             dtype="float32",
-    #             compressors=None,  # <- critical
-    #             filters=None,  # <- critical
-    #             overwrite=True,
-    #             fill_value=0.0,
-    #         )
-    #         wht[:] = weights[i]
-    #         weights[i] = wht
-
-    # # print(f"Pipeline (blocked storage) memory: {memory():.1f} GB")

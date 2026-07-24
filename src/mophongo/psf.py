@@ -474,25 +474,6 @@ class PSF:
         return self._fit_profile(model_func, {}, free_params, xc, yc, GaussianFit)
 
 
-def psf_matching_kernel_basis(
-    psf_hi: np.ndarray,
-    psf_lo: np.ndarray,
-    basis: np.ndarray,
-    *,
-    recenter: bool = False,
-) -> np.ndarray:
-    """Match ``psf_hi`` to ``psf_lo`` using basis function fitting."""
-
-    kernel, _ = fit_kernel_fourier(psf_hi, psf_lo, basis)
-    if recenter:
-        cy = (kernel.shape[0] - 1) / 2
-        cx = (kernel.shape[1] - 1) / 2
-        ycen, xcen = centroid_quadratic(kernel, xpeak=cx, ypeak=cy, fit_boxsize=5)
-        if not np.isnan(ycen) and not np.isnan(xcen):
-            kernel = shift(kernel, (cy - ycen, cx - xcen), order=3, mode="nearest")
-        else:
-            logger.warning("Centroiding failed, kernel not recentered.")
-    return kernel
 
 
 from pathlib import Path
@@ -666,24 +647,7 @@ class EffectivePSF:
 
         elif "NRC" in filter:
             self.eval_psf_type = "NRC"
-            # ndet = int(np.sqrt(epsf.shape[2]))
-            # rx = np.interp(x, [0, 512, 1024, 1536, 2048], [1, 2, 3, 4, 5]) - 1
-            # ry = np.interp(y, [0, 512, 1024, 1536, 2048], [1, 2, 3, 4, 5]) - 1
-            # nx = np.clip(int(rx), 0, 4)
-            # ny = np.clip(int(ry), 0, 4)
-            # fx = rx - nx
-            # fy = ry - ny
-            # if ndet == 1:
-            #     psf_xy = epsf[:, :, 0]
-            # else:
-            #     print(filter, ndet, nx, ny)
-            #     print(filter rx, ry, fx, fy, nx + (ny + 1) * ndet)
-            #     psf_xy = (1 - fx) * (1 - fy) * epsf[:, :, nx + ny * ndet]
-            #     psf_xy += fx * (1 - fy) * epsf[:, :, nx + 1 + ny * ndet]
-            #     psf_xy += (1 - fx) * fy * epsf[:, :, nx + (ny + 1) * ndet]
-            #     psf_xy += fx * fy * epsf[:, :, nx + 1 + (ny + 1) * ndet]
-            # psf_xy = psf_xy.T
-            # # Use grid-agnostic robust interpolation
+            # Use grid-agnostic robust interpolation
             xk = [0, 512, 1024, 1536, 2048]
             yk = [0, 512, 1024, 1536, 2048]
             nxps, nyps = len(xk), len(yk)
@@ -748,58 +712,8 @@ class EffectivePSF:
         return out
 
 
-def to_header(wcs, add_naxis=True, relax=True, key=None):
-    """Convert WCS to a FITS header with a few extra keywords."""
-    hdr = wcs.to_header(relax=relax, key=key)
-    if add_naxis:
-        if hasattr(wcs, "pixel_shape") and wcs.pixel_shape is not None:
-            hdr["NAXIS"] = wcs.naxis
-            hdr["NAXIS1"] = wcs.pixel_shape[0]
-            hdr["NAXIS2"] = wcs.pixel_shape[1]
-        elif hasattr(wcs, "_naxis1"):
-            hdr["NAXIS"] = wcs.naxis
-            hdr["NAXIS1"] = wcs._naxis1
-            hdr["NAXIS2"] = wcs._naxis2
-
-    if hasattr(wcs.wcs, "cd"):
-        for i in [0, 1]:
-            for j in [0, 1]:
-                hdr[f"CD{i + 1}_{j + 1}"] = wcs.wcs.cd[i][j]
-
-    if hasattr(wcs, "sip") and wcs.sip is not None:
-        hdr["SIPCRPX1"], hdr["SIPCRPX2"] = wcs.sip.crpix
-    return hdr
 
 
-def get_slice_wcs(wcs, slx, sly):
-    """Slice a WCS while propagating SIP and distortion keywords."""
-    nx = slx.stop - slx.start
-    ny = sly.stop - sly.start
-    swcs = wcs.slice((sly, slx))
-
-    if hasattr(swcs, "_naxis1"):
-        swcs.naxis1 = swcs._naxis1 = nx
-        swcs.naxis2 = swcs._naxis2 = ny
-    else:
-        swcs._naxis = [nx, ny]
-        swcs._naxis1 = nx
-        swcs._naxis2 = ny
-
-    if hasattr(swcs, "sip") and swcs.sip is not None:
-        for c in [0, 1]:
-            swcs.sip.crpix[c] = swcs.wcs.crpix[c]
-
-    acs = [4096 / 2, 2048 / 2]
-    dx = swcs.wcs.crpix[0] - acs[0]
-    dy = swcs.wcs.crpix[1] - acs[1]
-    for ext in ["cpdis1", "cpdis2", "det2im1", "det2im2"]:
-        if hasattr(swcs, ext):
-            extw = getattr(swcs, ext)
-            if extw is not None:
-                extw.crval[0] += dx
-                extw.crval[1] += dy
-                setattr(swcs, ext, extw)
-    return swcs
 
 
 # ---------------------------------------------------------------------
@@ -1261,161 +1175,3 @@ import numpy as np
 from astropy.io import fits
 from astropy.utils.data import download_file
 
-
-class NEffectivePSF:
-    """
-    Minimal JWST STDPSF loader/evaluator that *learns* the grid break-points
-    (IPSFX## / JPSFY##) from every cube it opens, so it works with any SIAF
-    release.
-    """
-
-    # ──────────────────────────────────────────────────────────────
-    def __init__(self):
-        self.epsf = OrderedDict()  # key → (Ny, Nx, Ncube)
-        self.grid_breaks = {}  # key → {'x':[...], 'y':[...]}
-        self.extended_epsf = {}  # unchanged
-        self.extended_N = None
-        self.eval_psf_type = None  # set in get_at_position
-
-    # ──────────────────────────────────────────────────────────────
-    # 1. LOAD CUBES ─ exactly as before, but store the break-points
-    # ──────────────────────────────────────────────────────────────
-    def _store_cube(self, key, hdu, clip_negative=False):
-        """Helper: transpose to (Ny,Nx,N), clip <0, save cube & breaks."""
-        dat = np.array([d.T for d in hdu.data]).T
-        if clip_negative:
-            dat[dat < 0] = 0
-        self.epsf[key] = dat
-
-        hdr = hdu.header
-        nxps = hdr.get("NXPSFS", 1)
-        nyps = hdr.get("NYPSFS", 1)
-        xk = [hdr[f"IPSFX{i:02d}"] for i in range(1, nxps + 1)]
-        yk = [hdr[f"JPSFY{i:02d}"] for i in range(1, nyps + 1)]
-        self.grid_breaks[key] = {"x": xk, "y": yk}
-
-    def load_jwst_stdpsf(
-        self,
-        *,
-        clip_negative=False,
-        local_dir=None,
-        filter_pattern=None,
-        verbose=False,
-    ):
-        """Load cubes from STScI site *or* a local directory (unchanged API)."""
-        # ─── Local directory mode ───────────────────────────────────────
-        if local_dir and filter_pattern:
-            self.filter_pattern = filter_pattern
-            regex = re.compile(filter_pattern, re.IGNORECASE)
-            for fp in Path(local_dir).rglob("*.fits"):
-                if regex.search(fp.name):
-                    with fits.open(fp) as hdul:
-                        if verbose:
-                            print(f"Loading {fp}")
-                        key = fp.stem
-                        self._store_cube(key, hdul[0], clip_negative)
-            return
-
-        # # ─── Remote STScI buckets ───────────────────────────────────────
-        # base = "https://www.stsci.edu/~jayander/JWST1PASS/LIB/PSFs/STDPSFs/"
-        # get = lambda url: download_file(url, cache=use_astropy_cache)
-        # # ---- MIRI ----
-        # miri_fmt = ("MIRI/EXTENDED/STDPSF_MIRI_{filt}_EXTENDED.fits"
-        #             if miri_extended else "MIRI/STDPSF_MIRI_{filt}.fits")
-
-    # ──────────────────────────────────────────────────────────────
-    # 2. GET AT POSITION ─ use stored break-points, not literals
-    # ──────────────────────────────────────────────────────────────
-    def get_at_position(self, x, y, filter, rot90=0):
-        """Return the oversampled PSF at (x,y) detector coords."""
-        epsf = self.epsf[filter]  # cube (Ny,Nx,N)
-        br = self.grid_breaks[filter]  # {'x': [...], 'y': [...]}
-
-        # Determine flavour
-        self.eval_psf_type = "HST/Optical"
-        if "MIRI" in filter:
-            self.eval_psf_type = "MIRI"
-        if "NRC" in filter:
-            self.eval_psf_type = "NRC"
-
-        # ---- generic 2×2 (MIRI) or 3×3 / 5×5 (NIRCam) bilinear blend
-        xk, yk = br["x"], br["y"]
-        nxps, nyps = len(xk), len(yk)
-        ndet = int(np.sqrt(epsf.shape[2]))  # 3×3 → 3 etc.
-
-        # 0-based fractional indices within the grid
-        rx = np.interp(x, xk, np.arange(nxps)) - 0
-        ry = np.interp(y, yk, np.arange(nyps)) - 0
-        ix, iy = np.clip(rx.astype(int), 0, nxps - 2), np.clip(ry.astype(int), 0, nyps - 2)
-        fx, fy = rx - ix, ry - iy
-
-        # Bilinear combination
-        psf_xy = (1 - fx) * (1 - fy) * epsf[:, :, ix + iy * ndet]
-        psf_xy += fx * (1 - fy) * epsf[:, :, ix + 1 + iy * ndet]
-        psf_xy += (1 - fx) * fy * epsf[:, :, ix + (iy + 1) * ndet]
-        psf_xy += fx * fy * epsf[:, :, ix + 1 + (iy + 1) * ndet]
-        psf_xy = psf_xy.T  # your historical transpose
-
-        if rot90:
-            psf_xy = np.rot90(psf_xy, rot90)
-
-        return psf_xy
-
-    # ──────────────────────────────────────────────────────────────
-    # 3. eval_ePSF unchanged
-    # ──────────────────────────────────────────────────────────────
-    def eval_ePSF(self, psf_xy, dx, dy, extended_data=None):
-        from scipy.ndimage import map_coordinates
-
-        if self.eval_psf_type in ("WFC3/IR", "HST/Optical"):
-            ok = (np.abs(dx) <= 12.5) & (np.abs(dy) <= 12.5)
-            coords = np.array([50 + 4 * dx[ok], 50 + 4 * dy[ok]])
-        else:
-            sz = (psf_xy.shape[0] - 1) // 4
-            x0 = sz * 2
-            cen = (x0 - 1) // 2
-            ok = (np.abs(dx) <= cen) & (np.abs(dy) <= cen)
-            coords = np.array([x0 + 4 * dx[ok], x0 + 4 * dy[ok]])
-
-        out = np.zeros_like(dx, dtype=np.float32)
-        out[ok] = map_coordinates(psf_xy, coords, order=3)
-
-        # optional extended halo
-        if extended_data is not None:
-            ok2 = (np.abs(dx) < self.extended_N) & (np.abs(dy) < self.extended_N)
-            coords = np.array([self.extended_N + dy[ok2], self.extended_N + dx[ok2]])
-            out[ok2] += map_coordinates(extended_data, coords, order=0)
-        return out
-
-
-def jwst_header(dataset_prefix, detector="mirimage", suffix="cal", ext=0):
-    """
-    dataset_prefix: e.g. 'jw01837001001_06101_00002'
-    detector: e.g. 'mirimage', 'nrca1', 'nrcblong', 'nrs1', ...
-    suffix: 'cal' or 'rate'
-    ext: 0 for primary, or 'SCI' / 1 etc.
-    """
-    filename = f"{dataset_prefix}_{detector}_{suffix}.fits"
-    uri = f"mast:JWST/product/{filename}"
-    url = f"https://mast.stsci.edu/api/v0.1/Download/file?uri={uri}"
-    # fsspec streaming: headers are fetched without pulling the whole file
-    with fits.open(url, use_fsspec=True) as hdul:
-        return hdul[ext].header, url
-
-
-# Try CAL then RATE; return the first that exists
-def jwst_probe_headers(dataset_prefix, detector="mirimage", try_suffixes=("cal", "rate"), ext=0):
-    last_err = None
-    for sfx in try_suffixes:
-        try:
-            hdr, url = jwst_header(dataset_prefix, detector=detector, suffix=sfx, ext=ext)
-            return hdr, url
-        except Exception as e:
-            last_err = e
-            continue
-    raise last_err
-
-
-# Example:
-# hdr, url = jwst_probe_headers("jw01837001001_06101_00002", detector="mirimage", try_suffixes=("cal","rate"), ext=0)
-# print(url); print(hdr.tostring(sep="\n")[:600])

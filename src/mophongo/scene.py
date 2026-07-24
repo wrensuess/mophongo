@@ -41,9 +41,6 @@ def _bbox_union(templates: Sequence[Template]) -> Tuple[int, int, int, int]:
     return y0, y1, x0, x1
 
 
-def _bbox_overlap(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
-    return not (a[1] <= b[0] or b[1] <= a[0] or a[3] <= b[2] or b[3] <= a[2])
-
 
 def _astrom_isolation_mask(A: sp.spmatrix, b: np.ndarray, thresh: float) -> np.ndarray:
     """Return bool mask: True where source contributes >= thresh of its own local flux.
@@ -794,13 +791,6 @@ class Scene:
             y0, y1, x0, x1 = tmpl.bbox
             seg[y0:y1, x0:x1] = int(lbl) + 1
         return seg, labels
-
-    @staticmethod
-    def _overlaps(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
-        """Return True if bounding boxes ``a`` and ``b`` overlap."""
-        y0a, y1a, x0a, x1a = a
-        y0b, y1b, x0b, x1b = b
-        return not (y1a <= y0b or y1b <= y0a or x1a <= x0b or x1b <= x0a)
 
     def plot(
         self,

@@ -17,7 +17,6 @@ from mophongo.utils import (
     psf_ee_at_radius,
     psf_ee_radius_pix,
     psf_stamp_containment,
-    rebin_wcs,
 )
 
 
@@ -84,14 +83,3 @@ def test_psf_stamp_containment_in_unit_interval() -> None:
     assert frac_full > frac
 
 
-@pytest.mark.xfail(
-    reason=(
-        "rebin_wcs (src/mophongo/utils.py) references an undefined name 'n' "
-        "(`factor = 2**n`) instead of its `factor` parameter -- a latent "
-        "NameError on any call. Documented here, not fixed (tests-only cleanup)."
-    ),
-    strict=False,
-)
-def test_rebin_wcs_latent_name_error() -> None:
-    w = _make_wcs(0.02)
-    rebin_wcs(w, 2)

@@ -283,22 +283,6 @@ class AlignedCutout:
         else:
             self.wcs = None
 
-    # ───────────── array-only helpers (no geometry changes) ─────────────
-
-    def as_block_reduced(self, factor: int, func=np.sum) -> np.ndarray:
-        """Return block-reduced self.data by `factor` (trims edges as needed)."""
-        if factor < 1 or int(factor) != factor:
-            raise ValueError("factor must be a positive integer")
-        return _block_reduce(self.data, int(factor), func=func)
-
-    def as_block_replicated(self, factor: int, conserve_sum: bool = True) -> np.ndarray:
-        """Return block-replicated self.data by `factor` (nearest upsample)."""
-        if factor < 1 or int(factor) != factor:
-            raise ValueError("factor must be a positive integer")
-        if factor == 1:
-            return np.asarray(self.data, dtype=np.float32, order="C")
-        return _block_replicate(self.data, int(factor), conserve_sum=conserve_sum)
-
     # ───────────── geometry-aware resampling (returns new cutouts) ────────────
 
     def downsample(self, factor: int) -> "AlignedCutout":
@@ -615,82 +599,6 @@ class Template(Cutout2D):
             new_cut.flag |= Template.FLAG_SUM_ZERO
 
         return new_cut
-
-    def downsample_wcs_old(self, image_lo: np.ndarray, wcs_lo, k: int) -> "Template":
-        """
-        Downsample this template to a lower resolution using the target image and WCS.
-
-        Parameters
-        ----------
-        image_lo : np.ndarray
-            The low-resolution image to extract the template from.
-        wcs_lo : astropy.wcs.WCS
-            The WCS of the low-resolution image.
-        k : int
-            Integer downsampling factor.
-
-        Returns
-        -------
-        Template
-            New template extracted from the low-res image using the correct WCS.
-        """
-        # Get the original position in the high-res WCS
-        pos = self.input_position_cutout  # needs to be cutout coordinates
-        ra, dec = self.wcs.wcs_pix2world(*pos, 0)
-
-        # Convert RA/Dec to pixel coordinates in the low-res WCS
-        # note: x_lo, y_lo are now original coordinates in the low-res image
-        x_lo, y_lo = wcs_lo.wcs_world2pix(ra, dec, 0)
-
-        # Calculate new size (downsampled)
-        height, width = self.data.shape[0] // k, self.data.shape[1] // k
-        # print('Original position:', pos)
-        # print(f"Downsampling {self.id} from {self.data.shape} to {height, width} at pos ({x_lo}, {y_lo})")
-        # print('original data shape:', self.shape_input, image_lo.shape)
-        # print(self.wcs)
-        # print(wcs_lo)
-        #        Create the new template using the low-res image and WCS
-        lowres_tmpl = Template(image_lo, (x_lo, y_lo), (height, width), wcs=wcs_lo, label=self.id)
-
-        # Fill the data with block-reduced (averaged) values from the high-res template
-        lowres_tmpl.data[:] = block_reduce(self.data, k, func=np.sum)
-        return lowres_tmpl
-
-    # block alignment methods currently not used
-    @staticmethod
-    def block_aligned(
-        pos: np.ndarray,  # [x_c, y_c] (float)
-        orig_size: np.ndarray,  # [ny, nx] (int)  <-- note reversed vs pos
-        block_align: int,
-        rfunc: Callable[[np.ndarray], np.ndarray] = np.ceil,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Return (size_aligned, idx_min_aligned) so that
-            idx_min_aligned = rfunc(pos - size_aligned/2)
-        and idx_min_aligned % k == 0,
-        with the smallest even Δsize per axis.
-
-        Conventions:
-        - pos is [x, y]
-        - size is [ny, nx]
-        """
-
-        # first force size to be minimum block size
-        size = np.maximum(np.asarray(orig_size), block_align).astype(np.int64)
-
-        # initial starts (paired with size[::-1] to match x↔nx, y↔ny)
-        idx0 = rfunc(pos - size[::-1] / 2.0).astype(np.int64)  # [x0, y0]
-
-        # minimal steps t: idx0 - t ≡ 0 (mod k)  ->  t ≡ idx0 (mod k)
-        steps = idx0 % block_align  # [tx, ty]
-
-        # add 2*steps to the paired sizes (map back with [::-1])
-        dsize = 2 * steps[::-1]  # [dny, dnx]
-        size_new = (size + dsize).astype(np.int64)  # [ny', nx']
-
-        # recompute aligned starts
-        idxmin = rfunc(pos - size_new[::-1] / 2.0).astype(np.int64)
-        return size_new, idxmin
 
     # verified for k=2,4 for sizes 4-16
     def downsample(
