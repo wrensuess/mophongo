@@ -76,7 +76,7 @@ def test_polynomial_astrometry_reduces_residual(tmp_path):
     tmpls = Templates.from_image(images[0], segmap, positions, kernel)
 
     fitter = SparseFitter(tmpls.templates, images[1], wht[1], FitConfig())
-    fitter.build_normal_matrix()
+    fitter.build_normal()
     flux, _, _ = fitter.solve()
     err = fitter.flux_errors()
     perr = fitter.predicted_errors()
@@ -125,7 +125,7 @@ def test_gp_astrometry_returns_models():
     tmpls = Templates.from_image(images[0], segmap, list(zip(catalog["x"], catalog["y"])), kernel)
 
     fitter = SparseFitter(tmpls.templates, images[1], wht[1], FitConfig())
-    fitter.build_normal_matrix()
+    fitter.build_normal()
     fitter.solve()
     fitter.flux_errors()
     res = fitter.residual()
@@ -145,20 +145,27 @@ def test_astromap_recovers_shift():
     )
     shx, shy = 0.4, -0.3
     shifted = nd_shift(images[0], (shy, shx))
+    # `catalog` has no "snr" column (make_simple_data doesn't compute one); give
+    # every source a passing SNR so AstroMap._measure's threshold gate lets them
+    # all through.
+    catalog["snr"] = 10.0
     amap = AstroMap(order=1, snr_threshold=3.0)
-    amap.fit(images[0], shifted, segmap)
+    amap.fit(images[0], shifted, catalog, snr_threshold=3.0)
     dx, dy = amap(np.array([[75.0, 75.0]]))
     assert abs(dx[0] - shx) < 0.3
     assert abs(dy[0] - shy) < 0.3
 
 
 def test_apply_template_shifts_uses_shift_field():
+    # Astrometry now stores the pending offset on Template.to_shift, and
+    # applying it is Templates.apply_template_shifts (AstroCorrect no longer
+    # owns this — the scene solver applies shifts directly to templates).
     data = np.zeros((7, 7))
     data[3, 3] = 1.0
     tmpl = Template(data, (3.0, 3.0), (7, 7), label=1)
-    tmpl.shift = np.array([0.5, -0.25])
+    tmpl.to_shift = np.array([0.5, -0.25])
 
-    AstroCorrect.apply_template_shifts([tmpl])
+    Templates.apply_template_shifts([tmpl])
 
     expected = nd_shift(
         data,
@@ -169,8 +176,9 @@ def test_apply_template_shifts_uses_shift_field():
         prefilter=True,
     )
     assert np.allclose(tmpl.data, expected)
-    assert np.allclose(tmpl.input_position_original, (2.5, 3.25))
-    assert np.allclose(tmpl.shift, 0.0)
+    assert np.allclose(tmpl.shifted, (0.5, -0.25))
+    assert np.allclose(tmpl.to_shift, 0.0)
+    assert tmpl.flag & Template.FLAG_SHIFTED
 
 
 def test_build_poly_predictor_returns_expected_shift():

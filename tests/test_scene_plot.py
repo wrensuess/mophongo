@@ -26,6 +26,8 @@ def test_scene_plot():
     for t in scene.templates:
         t.flux = 0.0
         t.err = 0.0
-    fig, ax = scene.plot(images[0])
+    # Scene.plot() requires both the hi-res template image and the segmap
+    # (signature changed to plot(tmpl_image, seg_image, ...)).
+    fig, ax = scene.plot(images[0], segmap)
     assert fig is not None
     plt.close(fig)

@@ -18,9 +18,13 @@ def test_pipeline_class_attributes():
         kernels=kernel,
         config=FitConfig(fit_astrometry_niter=0),
     )
-    cat, residuals, fitter = pl.run()
+    table, residuals = pl.run()
 
-    assert pl.catalog is cat
-    assert pl.residuals == residuals
-    assert pl.fitter is fitter
+    # run() returns (self.table, self.residuals): self.table is the output
+    # flux catalog, distinct from self.catalog (the untouched input catalog
+    # passed to __init__). The original assertion `pl.catalog is cat` compared
+    # against the wrong attribute; fixed to match what run() actually returns.
+    assert pl.table is table
+    assert pl.catalog is catalog
+    assert pl.residuals is residuals
     assert pl.astro is not None

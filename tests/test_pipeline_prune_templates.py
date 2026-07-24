@@ -19,8 +19,12 @@ def test_pipeline_prunes_templates_with_zero_weight():
     weights = [w0, w1]
     kernels = [None, None]
 
-    table, residuals, fitter = pipeline.run(images, segmap, catalog=catalog, weights=weights, kernels=kernels)
+    pl = pipeline.Pipeline(images, segmap, catalog=catalog, weights=weights, kernels=kernels)
+    table, residuals = pl.run()
 
-    assert len(fitter.templates) == 1
+    # `fitter` is not exposed on Pipeline; pl.all_templates[0] holds the
+    # templates actually used to fit the (only) band, which is the equivalent
+    # post-pruning count.
+    assert len(pl.all_templates[0]) == 1
     assert np.isfinite(table["flux_1"][0])
     assert np.isnan(table["flux_1"][1])

@@ -161,7 +161,7 @@ def test_effective_psf():
 
 import pytest
 
-@pytest.mark.skipif(1, reason="uses external data -> make smaller test")
+@pytest.mark.needs_data
 def test_drizzle_psf():
     import os
     import numpy as np

@@ -48,3 +48,12 @@ photutils = "^2.2.0"
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow-running (deselected by default, run with -m slow)",
+    "network: marks tests that require live network access (deselected by default)",
+    "needs_data: marks tests that require external/local data files not shipped with the repo (deselected by default)",
+    "benchmark: marks timing/performance benchmarks, not correctness tests (deselected by default)",
+]
+addopts = "-m \"not benchmark and not network and not needs_data and not slow\""

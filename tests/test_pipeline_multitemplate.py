@@ -13,7 +13,7 @@ def test_pipeline_multitemplate_pass():
     kernel = [mutils.matching_kernel(psfs[0], p) for p in psfs]
     kernel[0] = np.array([[1.0]])
     config = FitConfig(multi_tmpl_chi2_thresh=-1e-6, fit_astrometry_niter=0)
-    table, resid, fitter = pipeline.run(
+    pl = pipeline.Pipeline(
         images,
         segmap,
         catalog=catalog,
@@ -22,7 +22,18 @@ def test_pipeline_multitemplate_pass():
         kernels=kernel,
         config=config,
     )
-    assert len(fitter.templates) >= len(catalog)
+    table, resid = pl.run()
+    # NOTE: Pipeline.run()'s call to _add_templates_for_bad_fits (the code path
+    # that would add extra templates for poorly-fit sources when
+    # multi_tmpl_chi2_thresh is crossed) is currently commented out in
+    # src/mophongo/pipeline.py, so this no longer exercises the multi-template
+    # pass at all -- the assertion below is now a trivial sanity check (every
+    # catalog source produced a template), not a test of the multitemplate
+    # feature. The `fitter` object is also no longer exposed on Pipeline, so
+    # the original `len(fitter.templates)` check was replaced with the
+    # equivalent `pl.all_templates[0]` (templates used for the first/only
+    # fitted band).
+    assert len(pl.all_templates[0]) >= len(catalog)
     assert np.all(np.isfinite(table['flux_1']))
 
 

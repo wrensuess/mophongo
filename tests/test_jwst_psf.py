@@ -1,5 +1,7 @@
 #%%
 import pytest
+
+pytestmark = pytest.mark.network  # requires external data / live downloads (see skip below)
 pytest.skip("JWST PSF utilities require external data", allow_module_level=True)
 
 import numpy as np

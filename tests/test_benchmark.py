@@ -13,6 +13,7 @@ from utils import make_simple_data
 import pytest
 
 
+@pytest.mark.benchmark
 def test_benchmark_pipeline_steps():
     images, segmap, catalog, psfs, _, _ = make_simple_data(nsrc=20, size=101, ndilate=2)
     psf_hi = PSF.from_array(psfs[0])
@@ -57,6 +58,7 @@ from astropy.convolution import convolve as astro_convolve, convolve_fft
 from scipy import fft as spfft
 
 
+@pytest.mark.benchmark
 def test_benchmark_convolution():
     def run_benchmark(image, kernel, niter=5):
         # Precompute FFTs for caching test
@@ -973,6 +975,7 @@ def _to_df(rows):
     )
 
 
+@pytest.mark.benchmark
 def test_fits_variable_size_benchmarks(
     shape=(16384, 16384),  # ~1.0 GiB @ float32
     dtype=np.float32,
@@ -1061,6 +1064,7 @@ def test_fits_variable_size_benchmarks(
 # --------------------------- Example call -------------------------------------
 
 
+@pytest.mark.benchmark
 def test_fits_tile():
     # Run with defaults (~1 GiB image, 100k tiles, 24..40 varied sizes)
     df = test_fits_variable_size_benchmarks()

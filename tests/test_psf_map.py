@@ -31,7 +31,7 @@ def test_no_tiny_regions():
 def test_lookup():
     regmap = PSFRegionMap.from_footprints(footprints, crs=None)
     # pick a point firmly inside footprint 'A' only
-    key = regmap.lookup_key(0.1, 0.1)
+    key = regmap.resolve_key(0.1, 0.1)
     assert key is not None
     frames = regmap.regions.query("psf_key == @key").frame_list.iloc[0]
     assert frames == ("A",)
@@ -71,9 +71,9 @@ def test_pa_coarsening():
         "C": _make_wcs(90.0),
     }
     regmap = PSFRegionMap.from_footprints(fp, wcs=wcs, pa_tol=1.0, crs=None)
-    key_a = regmap.lookup_key(0.5, 0.5)
-    key_b = regmap.lookup_key(1.6, 0.5)
-    key_c = regmap.lookup_key(0.5, 1.6)
+    key_a = regmap.resolve_key(0.5, 0.5)
+    key_b = regmap.resolve_key(1.6, 0.5)
+    key_c = regmap.resolve_key(0.5, 1.6)
     assert key_a == key_b
     assert key_c != key_a
 
@@ -120,6 +120,28 @@ def test_containment_missing_column_defaults_to_one(tmp_path, caplog):
     assert any("containment" in rec.message for rec in caplog.records)
 
 
+def test_resolve_key_shared_by_psf_and_containment():
+    """``resolve_key`` is the single source of truth used by both ``get_psf``
+    and ``get_containment``: for a given sky position they must resolve from
+    the SAME region, and missing/NaN ra,dec must fall back to region 0
+    without raising."""
+    prm = _two_region_map(containment=np.array([0.9, 0.95]))
+
+    for ra, dec in [(0.5, 0.5), (1.5, 0.5)]:
+        key = prm.resolve_key(ra, dec)
+        psf = prm.get_psf(ra, dec)
+        cont = prm.get_containment(ra, dec)
+        assert np.array_equal(psf, prm.psfs[key])
+        assert cont == pytest.approx(prm.containment[key])
+
+    # NaN / None ra,dec -> region 0, no crash
+    assert prm.resolve_key(None, None) == 0
+    assert prm.resolve_key(0.5, None) == 0
+    assert prm.resolve_key(np.nan, np.nan) == 0
+    assert np.array_equal(prm.get_psf(None, None), prm.psfs[0])
+    assert prm.get_containment(None, None) == pytest.approx(prm.containment[0])
+
+
 def test_psf_stamp_containment_disk_fraction():
     """Sanity check against the analytic disk-in-Gaussian fraction: for an
     isotropic 2-D Gaussian, the flux in a centred disk of radius r is
@@ -142,7 +164,7 @@ def test_psf_stamp_containment_disk_fraction():
     assert frac == pytest.approx(expected, abs=0.01)
 
 
-@pytest.mark.skipif(1, reason="uses external data")
+@pytest.mark.needs_data
 def test_psf_region_map_from_file(tmp_path):
     import matplotlib.pyplot as plt
     import numpy as np

@@ -5,7 +5,7 @@ from mophongo import pipeline
 from mophongo.sim_data import make_mosaic_dataset
 from utils import save_flux_vs_truth_plot, save_diagnostic_image
 
-@pytest.mark.skipif(1, reason="uses external data")
+@pytest.mark.needs_data
 def test_realistic_pipeline(tmp_path):
     ds = make_mosaic_dataset(seed=3)
 

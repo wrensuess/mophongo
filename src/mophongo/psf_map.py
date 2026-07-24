@@ -234,7 +234,10 @@ class PSFRegionMap:
         key_mapping = {old_key: new_key for new_key, old_key in enumerate(unique_keys)}
         self.regions['psf_key'] = self.regions['psf_key'].map(key_mapping)
 
-        self.tree = STRtree(self.regions.geometry.to_list())
+        # Build the derived lookup constants (_geoms/_prepared/_keys/tree).
+        # __new__ bypasses __post_init__, so without this the fast-path
+        # attributes used by lookup_key/resolve_key are never set.
+        self.__post_init__()
         return self
 
     @classmethod
