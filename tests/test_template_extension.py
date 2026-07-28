@@ -163,7 +163,6 @@ def test_pipeline_run_sizes_cutouts_when_mode_set():
         aperture_diam=0.3,
         aperture_units="arcsec",
         fit_astrometry_niter=0,
-        run_scene_solver=False,
     )
     pl = Pipeline(
         images, segmap, catalog=catalog, psfs=psfs, wcs=wcs,
@@ -190,7 +189,6 @@ def test_pipeline_run_no_extension_when_mode_none():
     cfg = FitConfig(
         template_extend_mode="none",
         fit_astrometry_niter=0,
-        run_scene_solver=False,
     )
     pl = Pipeline(
         images, segmap, catalog=catalog, psfs=psfs, wcs=wcs,

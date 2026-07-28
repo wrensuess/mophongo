@@ -1,5 +1,17 @@
 # Test-suite cleanup plan
 
+> **⚠️ SUPERSEDED (2026-07-24) — historical record, do not act on this document.**
+>
+> The cleanup it describes was carried out, and the legacy `SparseFitter` was
+> subsequently retired entirely (`docs/dead_code.md`). Anything below that
+> discusses `SparseFitter`, `GlobalAstroFitter`, `solve_method`,
+> `build_normal_matrix`, or `tests/test_fit.py` refers to code that **no longer
+> exists** — those decisions were resolved by deletion, not by the fixes
+> proposed here. Sections A6/B3 in particular are moot.
+>
+> Kept because it records *why* several surviving `xfail`s exist and what the
+> suite is meant to protect. For current state see `docs/dead_code.md`.
+
 Status: **guide only — no code changed yet.** Produced after reading the current
 source (`src/mophongo/`) and every file in `tests/`, and running the suite.
 

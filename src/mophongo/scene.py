@@ -635,7 +635,7 @@ class Scene:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, int]:
         """
         Solve this scene. If A/b are not provided and not cached, build them.
-        Only build AB/BB/bB when cfg.fit_astrometry_joint is True; else flux-only.
+        Only build AB/BB/bB when cfg.fit_astrometry_niter > 0; else flux-only.
         Stores results on the Scene (stateless fitter).
         """
         cfg = config or self.config or FitConfig()
@@ -663,7 +663,7 @@ class Scene:
         self.is_bright = (snr_proxy > float(cfg.snr_thresh_astrom)) & not_star & isolated
 
         # flux-only path
-        if not cfg.fit_astrometry_joint:
+        if int(cfg.fit_astrometry_niter) <= 0:
             sol = SceneFitter.solve(A, b, config=cfg, **kwargs)
         else:
             # first guess solution from diagonal-only solution

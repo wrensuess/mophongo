@@ -13,9 +13,14 @@ from pathlib import Path
 from utils import make_simple_data
 from mophongo.psf import PSF
 from mophongo.templates import Templates, Template
-from mophongo.fit import SparseFitter, FitConfig
+from mophongo.fit import FitConfig
 from mophongo.astrometry import AstroCorrect, AstroMap, cheb_basis
-from mophongo.scene import generate_scenes, make_scene_basis, assemble_scene_system_AB
+from mophongo.scene import (
+    generate_scenes,
+    make_scene_basis,
+    assemble_scene_system_AB,
+    _slices_from_bbox,
+)
 from mophongo.scene_fitter import SceneFitter, build_normal
 from utils import save_diagnostic_image
 
@@ -60,6 +65,23 @@ def _run_scenes(templates, science, weight, cfg):
     return scenes
 
 
+def _scene_flux_and_residual(templates, science, weight, cfg=None):
+    """Flux-only scene solve; return (flux vector, full-frame residual).
+
+    AstroCorrect.fit() wants the fitted fluxes and an image residual that still
+    carries the astrometric signature, so this solves with astrometry off
+    (fit_astrometry_niter=0) and accumulates the per-scene models into a
+    full-frame model the same way Pipeline.run() does.
+    """
+    cfg = cfg or FitConfig(fit_astrometry_niter=0)
+    scenes = _run_scenes(templates, science, weight, cfg)
+    model = np.zeros_like(science, dtype=float)
+    for scene in scenes:
+        model[_slices_from_bbox(scene.bbox)] += scene.model_image()
+    flux = np.array([t.flux for t in templates], dtype=float)
+    return flux, science - model
+
+
 def test_polynomial_astrometry_reduces_residual(tmp_path):
     images, segmap, catalog, psfs, truth, wht = make_simple_data(
         nsrc=10, size=151, peak_snr=5, seed=42
@@ -75,17 +97,10 @@ def test_polynomial_astrometry_reduces_residual(tmp_path):
     positions = list(zip(catalog["x"], catalog["y"]))
     tmpls = Templates.from_image(images[0], segmap, positions, kernel)
 
-    fitter = SparseFitter(tmpls.templates, images[1], wht[1], FitConfig())
-    fitter.build_normal()
-    flux, _, _ = fitter.solve()
-    err = fitter.flux_errors()
-    perr = fitter.predicted_errors()
-    res = fitter.residual()
-
-    res0 = fitter.residual()
+    flux, res0 = _scene_flux_and_residual(tmpls.templates, images[1], wht[1])
 
     ac = AstroCorrect(FitConfig())
-    ac.fit(tmpls.templates, res0, fitter.solution)
+    ac.fit(tmpls.templates, res0, flux)
 
     rhx, rhy = ac(np.array([[50.0, 50.0]]))
 
@@ -124,15 +139,11 @@ def test_gp_astrometry_returns_models():
 
     tmpls = Templates.from_image(images[0], segmap, list(zip(catalog["x"], catalog["y"])), kernel)
 
-    fitter = SparseFitter(tmpls.templates, images[1], wht[1], FitConfig())
-    fitter.build_normal()
-    fitter.solve()
-    fitter.flux_errors()
-    res = fitter.residual()
+    flux, res = _scene_flux_and_residual(tmpls.templates, images[1], wht[1])
 
     cfg = FitConfig(astrom_model="gp", astrom_kwargs={"gp": {"length_scale": 30.0}})
     ac = AstroCorrect(cfg)
-    ac.fit(tmpls.templates, res, fitter.solution)
+    ac.fit(tmpls.templates, res, flux)
 
     dx, dy = ac(np.array([[50.0, 50.0]]))
     assert isinstance(float(dx[0]), float)
@@ -235,7 +246,7 @@ def test_scene_solver_recovers_known_shift():
     tmpls = Templates.from_image(images[0], segmap, positions, kernel)
 
     cfg = FitConfig(
-        fit_astrometry_joint=True,
+        fit_astrometry_niter=1,
         snr_thresh_astrom=3.0,
         scene_minimum_bright=2,
         scene_coupling_thresh=0.01,
@@ -292,7 +303,7 @@ def test_scene_shift_uncertainty_scales_with_psf_width():
     science_wide = nd_shift(science_wide, (true_dy, true_dx))
 
     cfg = FitConfig(
-        fit_astrometry_joint=True,
+        fit_astrometry_niter=1,
         snr_thresh_astrom=3.0,
         scene_minimum_bright=2,
         scene_coupling_thresh=0.01,
@@ -352,7 +363,7 @@ def test_scene_shift_depends_on_alpha0_scale():
     tmpls = Templates.from_image(images[0], segmap, positions, kernel)
 
     cfg = FitConfig(
-        fit_astrometry_joint=True,
+        fit_astrometry_niter=1,
         snr_thresh_astrom=0.0,
         scene_minimum_bright=1,
         scene_coupling_thresh=0.005,
@@ -444,7 +455,7 @@ def test_scene_shift_iteration_converges():
     tmpls = Templates.from_image(images[0], segmap, positions, kernel)
 
     cfg = FitConfig(
-        fit_astrometry_joint=True,
+        fit_astrometry_niter=1,
         snr_thresh_astrom=3.0,
         scene_minimum_bright=2,
         scene_coupling_thresh=0.01,

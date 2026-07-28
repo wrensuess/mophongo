@@ -159,10 +159,56 @@ This checklist tracks tasks for building the photometry pipeline using Poetry an
 - [x] Fix pre-existing off-by-one in Mode B scene bounding box: closed by the Mode B aperture
         rework. The aperture path uses half-open `slices_original`/`slices_cutout` directly and
         `Scene.model_image` uses `bb[1]-bb[0]+1`; no inclusive-bbox shape math remains in that path.
-- [ ] stale tests in `tests/test_fit.py` — 8 tests reference old `SparseFitter` method names
-        (`build_normal_matrix`, `solve_lo`, `bright_mask`, `solve_scene_shifts`) that have been
-        renamed or removed. Also `test_pipeline.py::test_download_rate` hangs on MAST network call.
-        Either update tests to match current API or delete if no longer relevant.
+- [x] stale tests in `tests/test_fit.py` — closed by retiring the legacy `SparseFitter`
+        entirely (see `docs/dead_code.md`). `tests/test_fit.py` and
+        `tests/test_sparse_cholesky.py` were deleted; the scene solver is now the only
+        fitting path. `test_pipeline.py::test_download_rate` remains network-marked.
+- [ ] **the pipeline is not reproducible — scene partitioning varies run-to-run.**
+        Established 2026-07-28 by direct experiment: `run_770.py` run twice with *identical*
+        code, inputs and config (F1500W, `r_trial=1`, 2890 sources) gives different output
+        catalogs. All 22 numeric columns differ. Same 2848 templates every time, but the
+        scene grouping — and even the scene *count* — changes:
+        `404,627,523,696,598` (5) vs `119,310,776,694,949` (5) vs `297,404,519,714,251,663` (6).
+        Scene membership sets which normal-matrix block a source is solved in, hence `err_1`
+        moves on ~98% of rows. Magnitude on `flux_1` is unbiased and small in the median
+        (0.12% bright / 0.38% faint, ~0.02-0.07 sigma), but ~6% of SNR>10 sources and ~5% of
+        SNR>50 sources shift by >1 sigma between identical runs — i.e. quoted errors on bright
+        sources understate the run-to-run spread.
+        Consequences: output catalogs can never be bit-compared, so A/B regression testing
+        against a saved run is inconclusive below ~2% (this defeated the attempt to validate
+        the SparseFitter retirement); and published fluxes are not reproducible from the
+        same inputs.
+        NOTE `random_state=0` IS set on the GP astrometry and there is no `np.random` in
+        `src/` — reading the code suggests determinism. That inference is empirically false.
+        Suspected mechanism (unverified): `scene_coupling_thresh` is a hard cut on ATA
+        couplings, so roundoff-level variation (multithreaded FFT/BLAS reduction order;
+        NumExpr reports 16 threads) flips couplings near the cut and cascades into different
+        connected components / `merge_small_scenes` outcomes.
+        First diagnostic to try: call `generate_scenes` twice inside ONE process on the same
+        templates. Identical → cause is cross-process (thread count, `PYTHONHASHSEED`, BLAS
+        scheduling) and pinning threads may fix it; different → it is inside the partitioning
+        code itself.
+- [ ] **tune the flux-block ridge — faint sources are biased low.** `SceneFitter.solve`
+        uses `flux_reg = 1e-6 * median(A.diagonal())`: adaptive *per scene*, but the same
+        absolute value for every source in that scene. Recovered flux goes as
+        `d_i / (d_i + reg)`, so a source whose own `ATA[i,i]` sits far below the scene
+        median is suppressed. Measured on a 2-template scene:
+        `d_i/median = 1e-3 → −0.05%`, `1e-4 → −0.5%`, `1e-5 → −4.8%`, `1e-6 → −33%`.
+        Same bug *class* as the F1800W `reg_astrom` fix (2026-03-27), one level down:
+        that one was absolute across the survey, this one is absolute within a scene.
+        Extended Estimator-3 templates spread `ΣT²` thin, so 1e-3–1e-4 ratios are
+        plausible in real scenes. Likely fix: make the ridge relative per source
+        (`reg_i ∝ d_i`) rather than a scene-wide constant.
+        NOTE: `FitConfig.reg` was deleted in the SparseFitter retirement (it had zero
+        readers — only the legacy solver ever read it). If the ridge becomes tunable,
+        reintroduce it deliberately as a live knob rather than restoring a dead field.
+        NOTE: the test that guarded this class (`test_regularization_does_not_bias_flux`)
+        lived in the deleted `tests/test_fit.py`; recover it from `8192f91` when fixing.
+- [ ] restore scene-solver coverage lost with `tests/test_fit.py` (see `docs/dead_code.md`):
+        the regularization-bias guard above, the null-shift invariant (joint astrometry
+        must not invent shifts on an aligned image), and `Templates.predicted_errors`,
+        which is live in production writing the `err_pred_{idx}` catalog column but now
+        has no test at all.
 - [ ] refactoring for readibility and modularity
   - [ ] split off PSF map / drizzle PSF / PSFs module, make submodule
   - [ ] split off real data as submodule?

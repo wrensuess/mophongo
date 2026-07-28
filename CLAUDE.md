@@ -25,8 +25,10 @@ The photometry pipeline follows this sequence:
 1. **Template Extraction** (`templates.py`) - Extract source templates from high-resolution detection image
 2. **PSF Handling** (`psf.py`, `psf_map.py`) - Manage point spread functions and spatially-varying PSF maps
 3. **Convolution/Matching** - Match PSFs between images using kernels
-4. **Sparse Fitting** (`fit.py`) - Solve for source fluxes using sparse matrix methods
-5. **Astrometric Correction** (`astrometry.py`) - Optional astrometric refinement
+4. **Scene Solving** (`scene.py`, `scene_fitter.py`) - Partition sources into
+   independent scenes and solve each for fluxes (+ joint astrometry) via sparse
+   normal equations. `fit.py` holds only the `FitConfig` dataclass.
+5. **Astrometric Correction** (`astrometry.py`) - Shift-field models applied to templates
 
 ### Key Classes and Components
 
@@ -34,10 +36,14 @@ The photometry pipeline follows this sequence:
 - `Template` - Individual source template (extends `astropy.nddata.Cutout2D`)
 - `Templates` - Collection manager with extraction, convolution, and downsampling
 
-**Fitting Framework** (`fit.py`):
-- `SparseFitter` - Main sparse matrix solver with configurable methods ('ata' or 'lo')
-- `FitConfig` - Configuration dataclass controlling fitting behavior
-- `GlobalAstroFitter` - Joint astrometry and photometry fitting
+**Fitting Framework**:
+- `FitConfig` (`fit.py`) - Configuration dataclass controlling fitting behavior.
+  This is all `fit.py` contains; the legacy `SparseFitter`/`GlobalAstroFitter`
+  solvers were retired (see `docs/dead_code.md`).
+- `Scene` (`scene.py`) - A group of templates coupled through overlap, solved
+  as one independent block; `generate_scenes()` partitions the field.
+- `SceneFitter` (`scene_fitter.py`) - Stateless solver for a single scene's
+  joint flux + astrometry system. This is the only solver.
 
 **PSF Management** (`psf.py`, `psf_map.py`):
 - `PSF` - Point spread function with analytic and array-based creation
@@ -57,13 +63,16 @@ The photometry pipeline follows this sequence:
 - Upsampling of lower-resolution images when needed
 
 **Sparse Matrix Optimization**:
-- Two solving methods: 'ata' (normal equations) and 'lo' (linear operator with iterative solvers)
-- Configurable regularization and positivity constraints
-- Fast FFT-based convolution for large templates (`config.fft_fast`)
+- Per-scene normal equations, Jacobi-whitened and solved with `spsolve`
+- Positivity constraint via `config.positivity`
+- Regularization is internal, not configurable: the flux block gets an adaptive
+  ridge (`1e-6 * median(diag A)`) and the shift block `config.reg_astrom`
 
 **Astrometric Refinement**:
-- Iterative astrometry fitting with configurable passes (`fit_astrometry_niter`)
-- Joint or separate astrometry solving modes
+- Iterative astrometry fitting with configurable passes (`fit_astrometry_niter`);
+  `0` disables astrometry entirely. This is the only astrometry on/off knob —
+  the old `fit_astrometry_joint` flag was removed, since the "separate" mode it
+  named lived in the retired legacy solver.
 - SNR-based source selection for astrometry
 
 **Memory Management**:
@@ -89,6 +98,11 @@ The photometry pipeline follows this sequence:
 
 **PSF Matching**: Kernel computation uses Fourier-domain matching with Tukey windowing for stable deconvolution.
 
-**Flux Errors**: Two error modes - simple diagonal errors and full covariance-based errors (`config.fit_covariances`).
+**Flux Errors**: `SceneFitter._flux_errors` takes `1/sqrt(diag)` of the *whitened*
+normal matrix, so errors do not reflect off-diagonal covariance between blended
+sources. The covariance-based mode (`config.fit_covariances`) was never
+implemented on the scene solver and the field was removed.
 
-**Multi-Component Fitting**: Support for adding PSF cores and color components for poorly-fit sources based on chi-squared thresholds.
+**Multi-Component Fitting**: Not implemented on the scene solver. The
+`multi_tmpl_*` config fields and their helper (`_add_templates_for_bad_fits`)
+were removed as dead code; see `docs/dead_code.md`.

@@ -36,7 +36,7 @@ def build_normal(
     image: np.ndarray,
     weights: np.ndarray,
 ) -> tuple[sp.csr_matrix, np.ndarray, "STRtree"]:
-    """Stateless clone of SparseFitter.build_normal_tree: returns (ATA, ATb, rtree)."""
+    """Build the sparse normal equations: returns (ATA, ATb, rtree)."""
     from shapely.geometry import box
     from shapely.strtree import STRtree
 
@@ -116,7 +116,7 @@ class SceneFitter:
     """Stateless solver for scene normal equations.
 
     The fitter whitens the flux block of the normal matrix, solves the
-    system using conjugate gradients and returns unwhitened fluxes and
+    system with a sparse direct solve and returns unwhitened fluxes and
     their 1σ uncertainties. Optionally, an additional shift block can be
     supplied which is solved jointly with the fluxes.
     """
@@ -130,7 +130,6 @@ class SceneFitter:
         BB: sp.spmatrix | None = None,
         bB: np.ndarray | None = None,
         config: Optional[FitConfig] = None,
-        cg_kwargs: Optional[dict] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, int]:
         """Solve ``A x = b`` with optional shift block.
 
@@ -140,18 +139,15 @@ class SceneFitter:
             Flux normal matrix (unwhitened).
         b
             Right hand side.
-        reg
-            Diagonal regularisation strength.
         AB, BB, bB
             Optional blocks coupling the fluxes to shift parameters.
-        cg_kwargs
-            Extra keyword arguments passed to :func:`scipy.sparse.linalg.cg`.
 
         Returns
         -------
         alpha, err, beta, info
-            Unwhitened fluxes, their 1σ errors, optional shift coefficients
-            and the CG exit flag.
+            Unwhitened fluxes, their 1σ errors and optional shift coefficients.
+            Regularisation is set internally: an adaptive ridge on the flux
+            block and ``config.reg_astrom`` on the shift block.
         """
         # Flux block: adaptive regularization relative to ATA scale (avoids biasing fluxes).
         # reg_astrom is reserved for the shift block only.
@@ -177,7 +173,12 @@ class SceneFitter:
     def solve_flux(
         A: sp.spmatrix, b: np.ndarray, config: Optional[FitConfig] = None
     ) -> tuple[np.ndarray, np.ndarray, dict]:
-        """Solve ``A x = b`` for flux parameters using conjugate gradient."""
+        """Solve ``A x = b`` for flux parameters via a sparse direct solve.
+
+        The system is Jacobi-whitened, solved with :func:`scipy.sparse.linalg.spsolve`,
+        then unwhitened. ``info["cg_info"]`` is kept as a constant 0 for callers
+        that read it; it is not a real solver exit flag.
+        """
         cfg = config or FitConfig()
         A = A.tocsr()
 

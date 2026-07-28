@@ -3,9 +3,9 @@ import pytest
 import scipy.sparse as sp
 
 from mophongo.scene_fitter import SceneFitter, build_normal
-from mophongo.scene import Scene
+from mophongo.scene import Scene, make_scene_basis, assemble_scene_system_AB
 from mophongo.templates import Templates, Template
-from mophongo.fit import SparseFitter, FitConfig
+from mophongo.fit import FitConfig
 from mophongo.psf import PSF
 from utils import make_simple_data
 
@@ -28,8 +28,10 @@ def test_scene_fitter_flux_only():
     # matrix, whose diagonal is 1 by construction -- so it is structurally
     # unable to reflect the off-diagonal covariance between components 1 and
     # 2 here, unlike the true sqrt(diag(inv(A))). Only assert the values it
-    # can actually produce (finite, positive); the orientation/covariance
-    # question itself is pinned separately in test_fit.py (see plan A6).
+    # can actually produce (finite, positive). NOTE: nothing currently pins the
+    # error orientation/covariance question -- the test that did lived in
+    # test_fit.py, which was deleted with the legacy SparseFitter. See the
+    # "coverage to restore" note in docs/dead_code.md.
     assert err.shape == expected.shape
     assert np.all(np.isfinite(err)) and np.all(err > 0)
 
@@ -69,7 +71,7 @@ def test_solve_flux_and_shifts_matches_dense(order):
     # order=2, the true least-squares flux has negative components; with the
     # default positivity=True clamp SceneFitter's answer would legitimately
     # diverge from the unconstrained dense solve.
-    cfg = FitConfig(cg_kwargs={"rtol": 1e-10, "maxiter": 1000}, positivity=False)
+    cfg = FitConfig(positivity=False)
     x, err, beta, info = SceneFitter._solve_flux_and_shifts(
         A, b, sp.csr_matrix(AB), BB, bB, config=cfg
     )
@@ -141,9 +143,35 @@ def test_scene_residuals():
 
 
 @pytest.mark.parametrize("order", [1, 2])
-def test_scene_solve_matches_legacy_solver(order):
+def test_scene_solve_matches_dense_on_real_templates(order):
+    """Scene.solve()'s joint flux+shift result matches a dense solve of the
+    same augmented system, on templates extracted from real simulated data.
+
+    This is the end-to-end counterpart to
+    test_solve_flux_and_shifts_matches_dense(), which pins the same linear
+    algebra on a small synthetic system. Here A and the coupling blocks come
+    from actual templates, so this additionally exercises Scene.solve()'s
+    scaling of the blocks (alpha0), its bright-mask handling, and the
+    whitening/unwhitening round trip on a realistic, badly-scaled system.
+
+    Scope limit, deliberately: the reference is built with the *same*
+    make_scene_basis()/assemble_scene_system_AB() that Scene.solve() calls, so
+    a bug inside those two functions would cancel on both sides and is NOT
+    caught here. What is caught is Scene.solve() feeding them the wrong inputs
+    or mishandling their output. Pinning the assembly itself against an
+    independent implementation is separate, missing coverage.
+
+    The `beta` assertion is the load-bearing one. The fluxes are nearly
+    insensitive to the shift block for isolated symmetric templates (the
+    gradient integrates to ~0, so AB ~ 0); `beta` scales as 1/alpha0 and does
+    respond, so it is what actually pins the coupling.
+    """
+    # nsrc=20 (not 5) so the shift block is full rank at BOTH orders: with 5
+    # sources, order=2 gives 12 shift coefficients against 5 sources ->
+    # rank(BB)=10/12, cond ~1e17, and the dense `beta` is meaningless. At
+    # nsrc=20: order=1 cond(BB)=7, order=2 cond(BB)=43, both full rank.
     images, segmap, catalog, psfs, truth, wht = make_simple_data(
-        nsrc=5, size=51, peak_snr=5, seed=order
+        nsrc=20, size=101, peak_snr=5, seed=order
     )
     psf_hi = PSF.from_array(psfs[0])
     psf_lo = PSF.from_array(psfs[1])
@@ -152,43 +180,52 @@ def test_scene_solve_matches_legacy_solver(order):
     tmpls = Templates.from_image(images[0], segmap, positions, kernel)
     image = images[1]
     weight = wht[1]
+    # positivity=False so the unconstrained dense reference below is the right
+    # ground truth (the default clamp would legitimately zero negative fluxes).
     cfg = FitConfig(
-        fit_astrometry_joint=True,
+        fit_astrometry_niter=1,
         snr_thresh_astrom=0.0,
+        astrom_isolation_thresh=0.0,
+        positivity=False,
         astrom_kwargs={"poly": {"order": order}},
     )
-    fitter = SparseFitter(tmpls.templates, image, weight, cfg)
+
     A, b, _ = build_normal(tmpls.templates, image, weight)
-    d = np.sqrt(A.diagonal())
-    Dinv = sp.diags(1.0 / d)
-    A_w = Dinv @ A @ Dinv
-    b_w = b / d
-    scene_ids = np.ones(len(tmpls.templates), dtype=int)
+
+    # Reference: assemble the same augmented system Scene.solve() builds and
+    # solve it densely.
+    d = np.asarray(A.diagonal(), dtype=float)
+    alpha0 = np.divide(b, d, out=np.zeros_like(b, dtype=float), where=d > 0)
     bright = np.ones(len(tmpls.templates), dtype=bool)
-    alpha_legacy, err_legacy, betas, infos = fitter._solve_scenes_with_shifts(
-        A_w,
-        b_w,
-        d,
-        scene_ids,
+    basis, _, _ = make_scene_basis(tmpls.templates, bright, order=order)
+    AB, BB, bB = assemble_scene_system_AB(
         tmpls.templates,
-        bright,
+        image,
+        weight,
+        basis,
+        alpha0=alpha0,
         order=order,
         include_y=True,
         ab_from_bright_only=True,
     )
-    beta_legacy = betas[0][1]
+    M = np.block([[A.toarray(), AB.toarray()], [AB.T.toarray(), BB.toarray()]])
+    rhs = np.concatenate([b, bB])
+    dense = np.linalg.solve(M, rhs)
+    n = A.shape[0]
 
     scene = Scene(id=1, templates=list(tmpls.templates), fitter=SceneFitter())
     scene.A = A
     scene.b = b
     scene.image = image
     scene.weights = weight
-    flux, err, beta_scene, info = scene.solve(
-        config=FitConfig(
-            fit_astrometry_joint=True,
-            snr_thresh_astrom=0.0,
-            astrom_kwargs={"poly": {"order": order}},
-        ),
-        apply_shifts=False,
-    )
-    np.testing.assert_allclose(flux, alpha_legacy, rtol=1e-3)
+    flux, err, beta_scene, info = scene.solve(config=cfg, apply_shifts=False)
+
+    # Guard the premise: if BB ever loses rank the dense `beta` below stops
+    # being a valid reference and the assertion would silently go vacuous.
+    assert np.linalg.matrix_rank(BB.toarray()) == BB.shape[0]
+
+    # SceneFitter.solve adds a small ridge to the flux block and to BB
+    # (reg_astrom * median(diag(BB))) before solving, so the agreement with the
+    # unregularized dense solve is ~1e-3, not machine precision.
+    np.testing.assert_allclose(flux, dense[:n], rtol=1e-3)
+    np.testing.assert_allclose(beta_scene, dense[n:], rtol=1e-2, atol=1e-3)

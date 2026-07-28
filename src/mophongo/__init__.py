@@ -1,5 +1,5 @@
 from .templates import Templates, Template
-from .fit import SparseFitter
+from .fit import FitConfig
 from .scene_fitter import SceneFitter
 from .scene import Scene
 from .astrometry import AstroCorrect, AstroMap
@@ -19,8 +19,7 @@ from photutils.segmentation import deblend_sources
 
 __all__ = [
 #    "Template",
-#    "FitConfig",
-    "SparseFitter",
+    "FitConfig",
     "SceneFitter",
     "Scene",
     "AstroCorrect",

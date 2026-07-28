@@ -8,7 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import numpy as np
 from mophongo.psf import PSF
 from mophongo.templates import Templates
-from mophongo.fit import SparseFitter
+from mophongo.fit import FitConfig
+from mophongo.scene import generate_scenes
 from utils import make_simple_data
 import pytest
 
@@ -25,8 +26,18 @@ def test_benchmark_pipeline_steps():
     extract_time = time.perf_counter() - start
 
     start = time.perf_counter()
-    fitter = SparseFitter(tmpls.templates, images[1])
-    fitter.solve()
+    cfg = FitConfig(fit_astrometry_niter=0)
+    scenes, _ = generate_scenes(
+        tmpls.templates,
+        images[1],
+        None,
+        coupling_thresh=cfg.scene_coupling_thresh,
+        snr_thresh_astrom=cfg.snr_thresh_astrom,
+        minimum_bright=cfg.scene_minimum_bright,
+    )
+    for scene in scenes:
+        scene.set_band(images[1], None, config=cfg)
+        scene.solve(config=cfg, apply_shifts=False)
     fit_time = time.perf_counter() - start
 
     print(f"Extraction time: {extract_time:.4f} s")

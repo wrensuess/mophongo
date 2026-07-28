@@ -18,9 +18,9 @@ Entries are grouped into **removal tiers** (see the workflow at the bottom):
 
 The critical/production path is: `Pipeline.run()` → scene solver
 (`generate_scenes`, `SceneFitter`, `Scene` in `scene.py`/`scene_fitter.py`) →
-`Templates`, `PSF`/`PSFRegionMap`, `Catalog`, `AstroCorrect`. `SparseFitter`
-(`fit.py`) is the *legacy* solver path — still imported and tested, still
-reachable when `config.run_scene_solver=False`, so treat it as live-but-legacy.
+`Templates`, `PSF`/`PSFRegionMap`, `Catalog`, `AstroCorrect`. As of 2026-07-24
+this is the **only** solver path: the legacy `SparseFitter` was retired and
+`fit.py` now contains nothing but `FitConfig`.
 
 Tests that would exercise broken code are parked as `xfail` so the defect stays
 visible without breaking the suite; fixing/removing the code lets those flip to
@@ -321,75 +321,170 @@ revisit after the retirement.
 
 ---
 
-## Planned: retire the legacy `SparseFitter`
+## Retired: the legacy `SparseFitter` — **done (2026-07-24)**
 
-**Decision (2026-07-24):** the scene solver (`SceneFitter`/`Scene`, default
-`run_scene_solver=True`) is the only solver needed. `SparseFitter` is the original
-photometry solver that itself grew an internal scene-partition path
-(`solve_scene`), so it is a near-complete duplicate of the standalone scene
-module. Retiring it removes the largest duplication in the codebase (Tier C).
+**Decision:** the scene solver (`SceneFitter`/`Scene`) is the only solver needed.
+`SparseFitter` was the original photometry solver that itself grew an internal
+scene-partition path (`solve_scene`), making it a near-complete duplicate of the
+standalone scene module. Retiring it removed the largest duplication in the
+codebase and closed Tier C.
 
-Scope this as **its own tier / its own commit**, with a real regression run — it
-touches the public API, the pipeline, and four test files, so it is bigger than
-the Tier A/B deletions.
+### What was removed
 
-### The one hard constraint
+- **`fit.py`** — stripped from 1373 lines to 126: the `SparseFitter` class and
+  every module-level helper that only it used (`_diag_inv_hutch`,
+  `sparse_cholesky`, `make_sparse_chol_prec`, `build_scene_tree_from_normal`,
+  `merge_small_scenes`, `make_basis_per_scene`, `assemble_scene_system_self_AB`,
+  `summarize_scenes`, `solve_scene_cg`, `build_normal_matrix`). Verified before
+  deletion that `scene.py`/`scene_fitter.py` use their **own** copies of the
+  scene-partition functions and their own `spsolve`/`np.linalg.cholesky`, so
+  nothing on the production path referenced these.
+- **`FitConfig` kept in `fit.py`** (the hard constraint: it is imported by
+  `__init__.py`, `pipeline.py`, `scene.py`, `scene_fitter.py`). Imports trimmed
+  to `dataclasses`/`typing`/`numpy`.
+- **Two now-orphaned `FitConfig` fields deleted**: `solve_method` (only
+  `SparseFitter.solve()` read it) and `run_scene_solver` (only the pipeline
+  legacy branch read it). Both would otherwise have become **silent no-ops** —
+  setting `run_scene_solver=False` would have run the scene solver anyway with
+  no warning. Deleting them turns that into a loud `TypeError`.
+- **`pipeline.py`** — the `run_scene_solver` conditional and its `else:
+  "Running legacy solver"` branch (~60 lines); the scene body was de-indented
+  one level and is now unconditional. Also removed: the `from .fit import
+  SparseFitter` import, the dead `_add_templates_for_bad_fits` helper (64 lines,
+  only ever called from a commented-out line inside the legacy branch), the
+  commented-out scene-vs-legacy residual cross-check (which can never be
+  reinstated), and the stale `-> tuple[..., SparseFitter]` annotation on the
+  module-level `run()` wrapper (which actually returns a 2-tuple).
+- **`__init__.py`** — `SparseFitter` replaced with `FitConfig` in the imports
+  and `__all__`.
 
-`FitConfig` **lives in `fit.py`** (`fit.py:49`) and is imported by `__init__.py`,
-`pipeline.py`, `astrometry.py`, `scene.py`, `scene_fitter.py`. So **`fit.py` is not
-deleted** — it is stripped down to `FitConfig` (+ any genuinely shared helper).
-Either keep `FitConfig` in `fit.py` (least churn) or move it to a new `config.py`
-and update those 5 import sites. Recommend keeping it in `fit.py` for now.
+### Tests
 
-### What gets removed
+- **Deleted**: `tests/test_fit.py` (12 tests) and `tests/test_sparse_cholesky.py`
+  (2 tests). The latter was the *only* consumer of `sparse_cholesky` /
+  `make_sparse_chol_prec` — those were built as a CG preconditioner for
+  `SparseFitter`'s `cg_kwargs["M"]` slot and were never wired to anything, so
+  the utilities and their test were dead together.
+- **`test_astrometry.py`** — repointed, not deleted. Added a
+  `_scene_flux_and_residual()` helper that solves via `generate_scenes` and
+  accumulates per-scene models into a full frame the way `Pipeline.run()` does.
+  Both shift-recovery assertions still hold on the scene solver.
+- **`test_scene_fitter.py`** — `test_scene_solve_matches_legacy_solver` became
+  `test_scene_solve_matches_dense_on_real_templates`. Rather than delete a
+  test whose reference implementation was being removed, it now compares
+  `Scene.solve()` against a **dense solve of the same augmented system** — a
+  real ground truth instead of a legacy twin. Only the flux block is compared:
+  with `nsrc=5` the shift block is underdetermined at orders 1-2 (6 and 12
+  coefficients respectively), so BB is rank-deficient and the unregularized
+  dense `beta` is not a well-defined reference. `beta` is pinned separately on a
+  well-posed system by `test_solve_flux_and_shifts_matches_dense`.
+- **`test_template_extension.py`** — two live tests were passing
+  `run_scene_solver=False`, i.e. genuinely exercising the legacy pipeline
+  branch. The flag was dropped so they use the scene solver.
+- **`test_benchmark.py`** — kept, not deleted. Only 1 of its 4 benchmarks used
+  `SparseFitter`; it was repointed to the scene solver. (Note: the unrelated
+  `test_benchmark_convolution` has a **pre-existing** failure — `NameError:
+  mophongo_fftconvolve` — that reproduces on `8192f91` and earlier. It is
+  `benchmark`-marked, hence deselected by default and invisible in normal runs.)
 
-- **`fit.py`**: the `SparseFitter` class and its embedded scene machinery —
-  `build_scene_tree_from_normal`, `merge_small_scenes`, `make_basis_per_scene`,
-  `assemble_scene_system_self_AB`, `summarize_scenes`, `_solve_scenes_with_shifts`,
-  `solve`, `solve_scene`, `_flux_errors`, `build_normal_tree`, `predicted_errors`,
-  `quick_flux` wrappers, etc. Free function `build_normal_matrix` goes too (only
-  tests use it). **Keep `FitConfig`.**
-- **`__init__.py`**: drop `SparseFitter` from imports and `__all__`.
-- **`pipeline.py`**: remove the `run_scene_solver=False` legacy branch
-  (`else: "Running legacy solver"`, ~`:1650-1712`), the `from .fit import
-  SparseFitter` import (`:1311`), and the stale `SparseFitter` type hints /
-  return-type annotations (`:199,203,229,1308,1928` — several already wrong, since
-  `run()` returns a 2-tuple). Audit the extend/refit helper at `:199`
-  (`fitter: SparseFitter`) — determine whether the scene path uses it and, if so,
-  retype it to `SceneFitter`; otherwise remove it.
-- **Tier C follow-on**: the pipeline legacy-branch scaffolding (already logged in
-  Tier C) is deleted as part of this.
+### Post-review follow-ups (2026-07-24)
 
-### Tests to update (this is most of the work)
+A code review and a science review were run on the change before commit. Both
+found real issues; all were fixed in the same commit.
 
-- **`test_fit.py`** — almost entirely `SparseFitter`/`build_normal_matrix`
-  exercises; delete the file (or keep only whatever still tests a retained helper).
-- **`test_benchmark.py`** — `SparseFitter` benchmark (already `benchmark`-marked /
-  deselected); delete or repoint to `SceneFitter`.
-- **`test_astrometry.py`** (`:78,:127`) — real astrometry tests built on
-  `SparseFitter`; **repoint** to the scene solver, don't just delete.
-- **`test_scene_fitter.py`** (`:160`) — uses `SparseFitter` to build a normal
-  matrix for comparison; repoint to `scene_fitter.build_normal`.
+**The legacy path was already broken.** Running `SparseFitter` at `8192f91`
+showed it was *not* the full-system solver it was described as — `solve()`
+dispatched to `solve_scene()`, which partitioned into scenes exactly like the
+production path. It was also broken three ways: `is_bright` was computed from
+`t.flux / t.err` (both 0 on a fresh fitter) → all-False → `AB.shape[1] == 0` →
+**astrometry silently never fit**; that same all-False mask made
+`merge_small_scenes` collapse every scene into one; and `_flux_errors` returned
+**exactly zero** errors for isolated sources. Consequence: no crowding regime
+lost anything, and the repointed astrometry tests reproduce baseline results
+bit-for-bit (`0.6519333, -0.5757352` on both sides; fluxes agree to 3.7e-16).
 
-### Suggested order (each step green before the next)
+**`fit_astrometry_joint` deleted; `fit_astrometry_niter` is now the only knob.**
+The flag named a "joint vs separate" choice that no longer exists — the separate
+fit-then-measure-residual path lived in the retired legacy branch — so it could
+only ever mean on/off, duplicating `niter`. It also created a trap: `niter=0`
+did *not* disable astrometry (`pipeline.py` does `max(niter, 1)` and
+`Scene.solve` gated only on the flag), contradicting the field's own comment.
+`Scene.solve` now gates on `fit_astrometry_niter > 0`, so `0` genuinely disables.
 
-1. Repoint `test_astrometry.py` and `test_scene_fitter.py` onto the scene solver;
-   confirm green. (Do this *first* so the safety net doesn't depend on the code
-   being removed.)
-2. Delete `test_fit.py` and `test_benchmark.py` (or reduce to retained helpers).
-3. Remove the pipeline legacy branch + `SparseFitter` import/type-hints.
-4. Remove `SparseFitter` (and the free `build_normal_matrix`) from `fit.py`,
-   keeping `FitConfig`.
-5. Update `__init__.py`.
-6. Full suite + one real-data scene-solver pipeline run to confirm no regression.
+**Further orphaned `FitConfig` fields deleted:** `reg`, `cg_kwargs`, `normal`,
+`fit_covariances`, `fft_fast`, `block_size`, `negative_snr_thresh`,
+`multi_tmpl_chi2_thresh`, `multi_tmpl_psf_core`, `multi_tmpl_colour`,
+`scene_merge_small` — all with zero readers. `reg` and `cg_kwargs` were orphaned
+*by* this change (only `SparseFitter.solve_scene` read them); the rest were
+already dead on the default path. The dead `cg_kwargs` parameter on
+`SceneFitter.solve` went too, along with docstrings claiming CG (it uses
+`spsolve`) and documenting a `reg` parameter that did not exist.
+
+**Further orphaned code deleted:** `pipeline._per_source_chi2` and
+`Templates.add_component` (both had `_add_templates_for_bad_fits` as their sole
+caller), a dead `astro = AstroCorrect(config)` local, and an unused
+`import warnings`.
+
+**Notebooks fixed.** `examples/full_pipeline.ipynb`, `uds.ipynb` and
+`snippets.ipynb` had live cells passing now-deleted kwargs (`solve_method='ata'`,
+`fit_astrometry_joint`, `multi_tmpl_chi2_thresh`). All patched. Note the
+`full_pipeline.ipynb` cells also unpack `table, res, fit = pipeline.run(...)`,
+a 3-tuple — `run()` returns 2. That breakage is **pre-existing** and left alone.
+
+**The rewritten scene test was too weak and was strengthened.** As first written,
+`test_scene_solve_matches_dense_on_real_templates` built its "dense reference"
+with the same `make_scene_basis`/`assemble_scene_system_AB` that `Scene.solve`
+calls, and asserted on flux only. Flux is the *insensitive* quantity here — for
+isolated symmetric templates the gradient integrates to ≈0, so a solve ignoring
+the astrometry blocks entirely differs by only 0.075% at order=2, inside the
+1e-3 tolerance. Injecting a 50% `alpha0` error passed; fully decoupling the
+shift block passed at order=2. Fixes: `nsrc` 5 → 20 (which makes `BB` full rank
+at both orders — order=2 went from rank 10/12, cond 1e17 to rank 12/12, cond 43,
+so the dense `beta` is now a valid reference), the `beta` assertion restored, and
+a rank guard added so the premise can't silently rot. All four perturbations are
+now caught. The docstring states the remaining scope limit: the reference still
+shares the assembler, so bugs *inside* those two functions cancel — pinning the
+assembly against an independent implementation is still missing coverage.
+
+### Coverage to restore (tracked in CHECKLIST.md)
+
+Three things `tests/test_fit.py` covered that nothing covers now:
+
+1. **`test_regularization_does_not_bias_flux`** — guarded commit `9d2ed2d`, a real
+   past flux bias. **The mechanism is still live:** `SceneFitter.solve` uses
+   `flux_reg = 1e-6 * median(A.diagonal())`, one absolute value per scene applied
+   to every source, so faint sources are suppressed as `d_i/(d_i + reg)` —
+   measured −0.5% at `d_i/median = 1e-4`, −33% at 1e-6. Same class as the F1800W
+   `reg_astrom` fix, one level down.
+2. **The null-shift invariant** — joint astrometry must not invent shifts on an
+   aligned image. Verified it still holds (`max|beta| = 2e-6` at order 0), so a
+   replacement would pass immediately.
+3. **`Templates.predicted_errors`** — live in production, writes the
+   `err_pred_{idx}` catalog column, now has zero tests.
+
+### Result
+
+Suite green: **134 passed, 2 skipped, 2 xfailed**. The drop from 147 passed / 3
+xfailed is fully accounted for by the two deleted files (11 passed + 1 xfail
+from `test_fit.py`, 2 passed from `test_sparse_cholesky.py`).
+
+Docs corrected for the new architecture: `CLAUDE.md` (the "Fitting Framework"
+section described `SparseFitter`/`GlobalAstroFitter` as the solvers),
+`CHECKLIST.md:162` (a stale to-do about `test_fit.py`), and a `scene_fitter.py`
+docstring that described `build_normal` as a "stateless clone of
+`SparseFitter.build_normal_tree`".
 
 ### Recovery
 
-The full `SparseFitter` implementation is preserved in git at the pre-retirement
-commit; `git show <that-commit>:src/mophongo/fit.py` restores it. Record the exact
-hash in the retirement commit message.
+The full `SparseFitter` implementation and both deleted test files are preserved
+in git at **`8192f91`** (the pre-retirement commit):
 
----
+```bash
+git show 8192f91:src/mophongo/fit.py
+git show 8192f91:tests/test_fit.py
+git show 8192f91:tests/test_sparse_cholesky.py
+git show 8192f91:src/mophongo/pipeline.py   # legacy branch + _add_templates_for_bad_fits
+```
 
 ## Tier B — decide first (redundant, but reachable / duplicated)
 
@@ -398,15 +493,19 @@ reachable, or where consolidation needs a one-line "keep which?" decision.
 
 ### Small bbox / slice-intersection helpers duplicated across 4 files
 
-- `utils.py:44` `intersection` == `fit.py:754` `SparseFitter._intersection`
-  (byte-identical).
-- `fit.py:772` `SparseFitter._slice_intersection` == `scene_fitter.py:22`
-  `_slice_intersection` (byte-identical).
+**Mostly resolved by the `SparseFitter` retirement (2026-07-24)** — both
+`SparseFitter._intersection` and `SparseFitter._slice_intersection` are gone, so
+only one copy of each now exists:
+
+- ~~`utils.py:44` `intersection` == `fit.py:754` `SparseFitter._intersection`~~ —
+  the `fit.py` copy was deleted with `SparseFitter`.
+- ~~`fit.py:772` `SparseFitter._slice_intersection` == `scene_fitter.py:22`~~ —
+  the `fit.py` copy was deleted; `scene_fitter.py` keeps the surviving one.
 - `pipeline.py:672` `_intersect_slices` is a related *extended* variant (maps
   into two local frames) — not a pure duplicate; leave.
 
-Cleanup: keep one copy of each identical helper in `utils.py`, import elsewhere.
-Low risk, but `scene_fitter.py` is on the critical path, so verify imports.
+Remaining (optional) cleanup: `scene_fitter.py:22` `_slice_intersection` could
+move to `utils.py` next to `intersection`. Cosmetic only — no duplication left.
 
 ### Direct convolution copy-pasted into two modules
 
@@ -441,12 +540,13 @@ is wanted, the decision is "fold into `get_bg_and_ivar`" instead of delete.
 
 ## Tier C — critical-path duplication (report only; do NOT touch without sign-off)
 
-> **Resolution (2026-07-24): retire the legacy `SparseFitter`.** The user
-> confirmed the scene solver (`SceneFitter`/`Scene`, the default) is the only
-> solver needed. `SparseFitter` and its embedded copy of the scene machinery are
-> the "legacy" duplication described below; removing `SparseFitter` collapses this
-> whole item. See **"Planned: retire the legacy SparseFitter"** below for scope.
-> The section below is retained as the analysis that motivated the decision.
+> **✅ Resolved (2026-07-24): the legacy `SparseFitter` was retired.** The scene
+> solver (`SceneFitter`/`Scene`) is now the only solver. `SparseFitter` and its
+> embedded copy of the scene machinery were the "legacy" duplication described
+> below, and removing them collapsed this whole item — the three-way duplication
+> is now a single implementation. See **"Retired: the legacy `SparseFitter`"**
+> above for what was actually done. The analysis below is retained as the
+> reasoning that motivated the decision.
 
 ### The scene solver is implemented **three times**
 
@@ -482,23 +582,25 @@ the user to decide): pick `scene.py`/`scene_fitter.py` as canonical and have
 `SparseFitter.solve_scene` delegate to it, or explicitly retire the legacy
 `fit.py` scene path.
 
-### pipeline.py — legacy-solver `else` branch scaffolding (`pipeline.py:1652-1724`)
+### pipeline.py — legacy-solver `else` branch scaffolding — **✅ deleted**
 
-Inside `else: print("Running legacy solver")` (reachable when
-`run_scene_solver=False`, exercised by `test_template_extension.py`):
-dead `fitter_cls` selection now hardcoded to `SparseFitter` (`:1652-1656`), a
-separate non-joint astrometry call marked `# @@@ this is very expensive`
-(`:1666-1671`), a flux-only re-solve calling the commented-out
-`_add_templates_for_bad_fits` (`:1680-1692`), a soft non-negative-prior re-solve
-(`:1697-1705`), and a commented scene-vs-full-residual check (`:1713-1724`).
-Stale scaffolding, but on a tested legacy path — flag before deleting.
+All of it went with the retirement: the `fitter_cls` selection, the separate
+non-joint astrometry call marked `# @@@ this is very expensive`, the flux-only
+re-solve calling `_add_templates_for_bad_fits` (that helper is also gone — its
+only call site was the commented-out line inside this branch), the soft
+non-negative-prior re-solve, and the commented scene-vs-full-residual check.
 
-### `build_normal_matrix` (`fit.py:1643`)
+### `build_normal_matrix` — **✅ deleted**
 
-Broken bound-method dispatch — see Tier A (it lives under the OBSOLETE banner).
-Reachable only via `config.normal="loop"`, which raises `AttributeError`; the
-default `"tree"` path is fine. Tier A delete, but the `"loop"` config option must
-be dropped or the method re-bound as part of the same change.
+Removed with `SparseFitter`. The related `FitConfig.normal` field
+(`"tree"`/`"loop"`) still exists but now has **zero readers** — `scene_fitter.py`
+always builds the tree form. It joins the other orphaned `FitConfig` fields
+(`fit_covariances`, `fft_fast`, `block_size`, `negative_snr_thresh`,
+`multi_tmpl_colour`, `scene_merge_small` — all zero readers in `src/`). These
+were orphaned *before* this work, not by it, so they were left alone; worth a
+dedicated config-audit pass. Contrast with `solve_method` and
+`run_scene_solver`, which this change orphaned and which were therefore deleted
+in the same commit.
 
 ---
 
