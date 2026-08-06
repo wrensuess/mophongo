@@ -24,6 +24,7 @@ from astropy.nddata import Cutout2D, block_replicate, block_reduce
 from photutils.aperture import CircularAperture, aperture_photometry
 from photutils.segmentation import SegmentationImage, SourceCatalog
 from astropy.wcs.utils import proj_plane_pixel_scales
+from scipy.ndimage import find_objects, maximum_filter
 
 from .psf_map import PSFRegionMap
 from . import utils
@@ -51,6 +52,101 @@ memory = lambda: psutil.Process(os.getpid()).memory_info().rss / 1e9
 # else:
 #     ra, dec = x, y
 # kern = kernel.get_psf(ra, dec)
+
+
+def _sources_with_coverage(
+    segmap: np.ndarray,
+    cat: Table,
+    wcs: Sequence[WCS] | None,
+    weights: Sequence[np.ndarray] | None,
+    min_size: int,
+) -> np.ndarray:
+    """Boolean mask of catalog rows worth building a template for.
+
+    MIRI mosaics often cover a small fraction of the detection (F444W) area, so
+    building every detection template and pruning afterwards wastes most of the
+    extraction. A source is kept when *any* fitted band has positive weight
+    inside the footprint its template will occupy -- the segment bbox, floored
+    at ``min_size // 2``, which the pipeline pre-sizes to hold the PSF extension
+    radius ``r_fill`` (see the min_size floor in Pipeline.run).
+
+    The radius is per-source on purpose: one global radius would be set by the
+    largest segment in the field, and a single bright-star halo (~4000 px in
+    UDS) dilates the coverage mask until nothing is cut at all.
+
+    This mirrors ``Templates.prune_outside_weight``, which still does the exact
+    per-band cut -- on unconvolved templates, hence no kernel margin here. The
+    rough cut only skips templates that cannot survive it in any band, and is
+    itself skipped whenever coverage cannot be established (no weights, no WCS,
+    or a weightless band, which counts as full coverage).
+    """
+    keep = np.ones(len(cat), dtype=bool)
+    if weights is None or wcs is None or len(weights) < 2:
+        return keep
+    bands = range(1, len(weights))
+    if any(weights[i] is None or wcs[i] is None for i in bands):
+        return keep
+
+    # Non-finite or off-image positions are parked at pixel 0 and dropped via
+    # has_seg -- the same sources extract_templates skips.
+    x = np.asarray(cat["x"], dtype=float)
+    y = np.asarray(cat["y"], dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    xi = np.round(np.where(finite, x, 0.0)).astype(int)
+    yi = np.round(np.where(finite, y, 0.0)).astype(int)
+    ny, nx = segmap.shape
+    inside = finite & (xi >= 0) & (xi < nx) & (yi >= 0) & (yi < ny)
+    labels = np.where(inside, segmap[np.clip(yi, 0, ny - 1), np.clip(xi, 0, nx - 1)], 0)
+
+    # Per-source template half-size on the detection grid, exactly as
+    # Templates.extract_templates sizes its cutouts. photutils' bbox.iymax is
+    # exclusive, i.e. equal to the find_objects slice stop.
+    slices = find_objects(segmap)
+    bbox = np.zeros((len(slices) + 1, 4), dtype=float)
+    for lab, sl in enumerate(slices, start=1):
+        if sl is not None:
+            bbox[lab] = (sl[0].start, sl[0].stop, sl[1].start, sl[1].stop)
+
+    has_seg = labels > 0
+    half = np.full(len(cat), float(min_size // 2))
+    b = bbox[labels]
+    half[has_seg] = np.maximum.reduce(
+        [yi - b[:, 0], b[:, 1] - yi, xi - b[:, 2], b[:, 3] - xi, half]
+    )[has_seg]
+
+    sky = wcs[0].pixel_to_world(np.where(finite, x, 0.0), np.where(finite, y, 0.0))
+    keep = np.zeros(len(cat), dtype=bool)
+    for i in bands:
+        w = weights[i]
+        wh, ww = w.shape
+        k = bin_factor_from_wcs(wcs[0], wcs[i])
+        # +1 absorbs the rounding of the centre to an integer pixel and the WCS
+        # round-trip, so the tested box always contains the template footprint.
+        radius = np.ceil(half / k).astype(int) + 1
+        xb, yb = wcs[i].world_to_pixel(sky)
+        xb, yb = np.round(xb).astype(int), np.round(yb).astype(int)
+
+        # Nearly every source sits at the floor radius, so dilating the coverage
+        # by it once turns their box test into a single lookup. Segments larger
+        # than the floor are ~1% of a real segmap, but a single star halo can be
+        # thousands of pixels across -- using one global radius would dilate the
+        # whole field by it -- so those get their own box tested instead.
+        r0 = int(np.ceil((min_size // 2) / k)) + 1
+        cov = maximum_filter(w > 0, size=2 * r0 + 1)
+        centred = (xb >= 0) & (xb < ww) & (yb >= 0) & (yb < wh)
+        fast = has_seg & ~keep & centred & (radius == r0)
+        keep[fast] = cov[yb[fast], xb[fast]]
+
+        near = (
+            (xb >= -radius) & (xb < ww + radius) & (yb >= -radius) & (yb < wh + radius)
+        )
+        for j in np.nonzero(has_seg & ~keep & ~fast & near)[0]:
+            r = int(radius[j])
+            y0, y1 = max(int(yb[j]) - r, 0), min(int(yb[j]) + r + 1, wh)
+            x0, x1 = max(int(xb[j]) - r, 0), min(int(xb[j]) + r + 1, ww)
+            keep[j] = y1 > y0 and x1 > x0 and bool(np.any(w[y0:y1, x0:x1] > 0))
+
+    return keep
 
 
 def _extract_psf_at(tmpl: Template, psf: np.ndarray | PSFRegionMap) -> np.ndarray:
@@ -1399,11 +1495,22 @@ class Pipeline:
                     "extracting truncated templates (no extension).", extend_mode,
                 )
 
+        # Rough cut: skip sources that cannot touch any fitted band's coverage.
+        keep = _sources_with_coverage(segmap, cat, wcs, weights, min_size)
+        n_cut = int((~keep).sum())
+        if n_cut:
+            print(
+                f"Rough cut: {n_cut} of {len(cat)} sources have no coverage in any "
+                "fitted band; skipping their templates."
+            )
+        xs = np.asarray(cat["x"], dtype=float)[keep]
+        ys = np.asarray(cat["y"], dtype=float)[keep]
+
         self.tmpls = Templates(min_size=min_size)
         self.tmpls.extract_templates(
             images[0],
             segmap,
-            list(zip(cat["x"], cat["y"])),
+            list(zip(xs, ys)),
             wcs=wcs[0] if wcs is not None else None,
             **extract_kw,
         )

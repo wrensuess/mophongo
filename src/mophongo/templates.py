@@ -958,7 +958,36 @@ class Templates:
         return sig if sig > 0 else None
 
     @staticmethod
-    def _build_ownership(segmap: np.ndarray, radius: float) -> np.ndarray:
+    def _cutout_roi(
+        sized: list[tuple], shape: tuple[int, int], step: int = 8
+    ) -> np.ndarray:
+        """Coarse bool mask of every pixel a retained cutout will read.
+
+        ``sized`` is the resolved ``(pos, label, height, width)`` list, so the
+        ROI is built from exactly the same sizing arithmetic the extraction loop
+        uses -- the two must not drift, or a skipped label could turn out to
+        matter. Boxes are rounded outward and coarsened by ``step`` (a full-res
+        bool would be ~875 MB on a MINERVA field, 14 MB at step 8); marking extra
+        territory only ever keeps extra labels in :meth:`_build_ownership`.
+        """
+        ny, nx = shape
+        roi = np.zeros((-(-ny // step), -(-nx // step)), dtype=bool)
+        for pos, _label, height, width in sized:
+            y0 = max(int(np.floor(pos[1] - height / 2)), 0)
+            y1 = min(int(np.ceil(pos[1] + height / 2)) + 1, ny)
+            x0 = max(int(np.floor(pos[0] - width / 2)), 0)
+            x1 = min(int(np.ceil(pos[0] + width / 2)) + 1, nx)
+            roi[y0 // step: -(-y1 // step), x0 // step: -(-x1 // step)] = True
+        return roi
+
+    @staticmethod
+    def _build_ownership(
+        segmap: np.ndarray,
+        radius: float,
+        *,
+        roi: np.ndarray | None = None,
+        roi_step: int = 1,
+    ) -> np.ndarray:
         """Global area-weighted ownership map (IDL ``kseg>knn``, made disjoint).
 
         For every pixel, the owner is the segment label with the largest local
@@ -971,6 +1000,15 @@ class Templates:
 
         Returns an int label map (0 = unowned background beyond ``radius`` of any
         segment). Segment pixels keep their own label.
+
+        ``roi`` (a bool mask coarsened by ``roi_step``, from :meth:`_cutout_roi`)
+        restricts the loop to labels that can affect a pixel some template will
+        actually read. A label writes only inside its own bbox padded by
+        ``radius``, so if that window misses the ROI entirely it cannot change
+        any pixel inside it -- the restricted result is *identical* there, not
+        approximate. Without it every label in the mosaic is processed, which on
+        a full MINERVA field is minutes of work for sources the rough cut has
+        already discarded.
         """
         disk = Templates._disk_kernel(radius)
         pad = disk.shape[0] // 2
@@ -988,6 +1026,14 @@ class Templates:
             label = i + 1
             y0, y1 = max(0, sl[0].start - pad), min(ny, sl[0].stop + pad)
             x0, x1 = max(0, sl[1].start - pad), min(nx, sl[1].stop + pad)
+            # Skip labels that cannot write anywhere a template will be read.
+            # Ceiling division on the stops so the coarse window always covers
+            # the fine one -- rounding outward can only keep extra labels.
+            if roi is not None and not roi[
+                y0 // roi_step: -(-y1 // roi_step),
+                x0 // roi_step: -(-x1 // roi_step),
+            ].any():
+                continue
             sub = segmap[y0:y1, x0:x1]
             # Area of this label within the disk. Round to integer: fftconvolve of
             # binary arrays carries ~1e-15 noise that would otherwise break exact
@@ -1290,6 +1336,33 @@ class Templates:
         templates: list[Template] = []
         ny, nx = hires_image.shape
 
+        # Resolve every position to its segment and cutout size up front. The
+        # ownership ROI below and the extraction loop must size cutouts with the
+        # same arithmetic, so it happens once here and both consume the result.
+        sized: list[tuple] = []
+        for pos in positions:
+            # silently skip invalid positions
+            if not np.isfinite(pos).all():
+                continue
+            x, y = int(round(pos[0])), int(round(pos[1]))
+            if y < 0 or y >= ny or x < 0 or x >= nx:
+                continue
+            label = segm.data[y, x]
+            if label == 0:
+                continue
+
+            # searchsorted directly rather than segm.get_index(label): the label
+            # was just read out of segm.data, so it needs no validation, and
+            # get_index's check_labels scans every label on every call (~4 ms per
+            # source on a 345k-source segmap, minutes over a full field).
+            bbox = segm.bbox[np.searchsorted(segm.labels, label)]
+
+            # Make bbox symmetric around the center to ensure proper centering
+            # enfore minimum size
+            height = max(y - bbox.iymin, bbox.iymax - y, self.min_size // 2) * 2
+            width = max(x - bbox.ixmin, bbox.ixmax - x, self.min_size // 2) * 2
+            sized.append((pos, label, height, width))
+
         extend = extend_mode != "none"
         bg_rms = None
         owner_map = None
@@ -1304,33 +1377,20 @@ class Templates:
             # wins inter-source territory out to max_radius. A future refinement
             # could decouple these (assign reach by nearest-owner out to the cap,
             # but run the area-weighted boundary contest at ~R50 in overlap zones).
-            owner_map = self._build_ownership(segmap, max_radius_pix)
+            roi_step = 8
+            owner_map = self._build_ownership(
+                segmap,
+                max_radius_pix,
+                roi=self._cutout_roi(sized, (ny, nx), step=roi_step),
+                roi_step=roi_step,
+            )
             # The auto tree always needs a per-source noise estimate (snr_seg /
             # snr_wings). Prefer the formal noise from the detection weight
             # (inverse-variance) map; fall back to a clipped sky sigma when absent.
             if detection_weight is None:
                 bg_rms = self._background_sigma(hires_image, segmap)
 
-        for pos in tqdm(positions, desc="Extracting templates"):
-            # silently skip invalid positions
-            if not np.isfinite(pos).all():
-                continue
-            x, y = int(round(pos[0])), int(round(pos[1]))
-            if y < 0 or y >= ny or x < 0 or x >= nx:
-                continue
-            label = segm.data[y, x]
-            if label == 0:
-                continue
-
-            idx = segm.get_index(label)
-            bbox = segm.bbox[idx]
-            segm.slices[idx]
-
-            # Make bbox symmetric around the center to ensure proper centering
-            # enfore minimum size
-            height = max(y - bbox.iymin, bbox.iymax - y, self.min_size // 2) * 2
-            width = max(x - bbox.ixmin, bbox.ixmax - x, self.min_size // 2) * 2
-
+        for pos, label, height, width in tqdm(sized, desc="Extracting templates"):
             # Create template cutout
             cut = Template(hires_image, pos, (height, width), wcs=wcs, label=label)
 
